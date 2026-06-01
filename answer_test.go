@@ -81,8 +81,20 @@ func TestAnswerUsesSearchResultsInWriterPrompt(t *testing.T) {
 	if !strings.Contains(prompt, "Alpha fact") || !strings.Contains(prompt, "[number]") {
 		t.Fatalf("writer prompt missing source context/citation instruction: %s", prompt)
 	}
+	if !strings.Contains(prompt, "Every sentence in the response that relies on web context should include at least one citation") {
+		t.Fatalf("writer prompt missing original-style per-sentence citation instruction: %s", prompt)
+	}
 	if strings.Count(prompt, `https://example.com/a`) != 1 {
 		t.Fatalf("duplicate URL was not deduplicated in prompt: %s", prompt)
+	}
+}
+
+func TestQualityWriterPromptMatchesOriginalDepthRequirement(t *testing.T) {
+	prompt := getWriterPrompt("<search_results><result index=\"1\">Fact</result></search_results>", "", "", ModeQuality, time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC))
+	if !strings.Contains(prompt, "at least 2000 words") ||
+		!strings.Contains(prompt, "frame the answer like a research report") ||
+		!strings.Contains(prompt, "do not add a main title") {
+		t.Fatalf("quality writer prompt missing original depth/format requirements: %s", prompt)
 	}
 }
 

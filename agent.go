@@ -499,7 +499,7 @@ func (r Researcher) researchDeterministic(ctx context.Context, req ResearchReque
 		StepTotal: iterations,
 		Queries:   append([]string(nil), queries...),
 	})
-	seen := map[string]bool{}
+	seen := map[string]int{}
 	var out []SearchResult
 	var firstErr error
 	for step, query := range queries {
@@ -535,10 +535,14 @@ func (r Researcher) researchDeterministic(ctx context.Context, req ResearchReque
 					result.Source = source
 				}
 				key := canonicalResultKey(result)
-				if key == "" || seen[key] {
+				if key == "" {
 					continue
 				}
-				seen[key] = true
+				if existing, ok := seen[key]; ok {
+					out[existing] = mergeSearchResult(out[existing], result)
+					continue
+				}
+				seen[key] = len(out)
 				out = append(out, result)
 			}
 			emitSearchEvent(ctx, r.OnSearchEvent, SearchEvent{

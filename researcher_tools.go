@@ -60,7 +60,7 @@ func (r Researcher) researchWithTools(ctx context.Context, req ResearchRequest) 
 		model.NewUserMessage(fmt.Sprintf("<conversation>\n%s\nUser: %s (Standalone question: %s)\n</conversation>", formatMessagesForPrompt(tailMessages(req.Messages, 10)), req.Query, query)),
 	}
 	var out []SearchResult
-	seen := map[string]bool{}
+	seen := map[string]int{}
 	var firstErr error
 	usedTools := false
 	failedInfoCalls := 0
@@ -127,10 +127,14 @@ func (r Researcher) researchWithTools(ctx context.Context, req ResearchRequest) 
 			before := len(out)
 			for _, result := range actionResult.Results {
 				key := canonicalResultKey(result)
-				if key == "" || seen[key] {
+				if key == "" {
 					continue
 				}
-				seen[key] = true
+				if existing, ok := seen[key]; ok {
+					out[existing] = mergeSearchResult(out[existing], result)
+					continue
+				}
+				seen[key] = len(out)
 				out = append(out, result)
 			}
 			if len(out) > totalResultLimit(req.Mode) {
@@ -242,7 +246,7 @@ func (r Researcher) availableResearchTools(req ResearchRequest) map[string]tool.
 			return r.scrapeURLs(ctx, req, args.URLs)
 		},
 		function.WithName("scrape_url"),
-		function.WithDescription("Scrape and extract content from specific URLs. Use only when the user asks about exact URLs or when deep reading is necessary."),
+		function.WithDescription("Scrape and extract content from specific URLs. Use only when the user explicitly asks about exact URLs. NEVER call this tool yourself just to get extra information."),
 		function.WithInputSchema(&tool.Schema{Type: "object", Required: []string{"urls"}, Properties: map[string]*tool.Schema{
 			"urls": {Type: "array", Description: "URLs to scrape, maximum 3.", Items: &tool.Schema{Type: "string"}},
 		}}),
@@ -572,11 +576,44 @@ Research iteration: %d of %d
 </response_protocol>`, today, i+1, maxIteration, actionDesc)
 	switch req.Mode {
 	case ModeSpeed:
-		return base + "\nSpeed mode: act quickly. One strong search call followed by done is usually enough."
+		return base + `
+
+<speed_mode>
+- Act quickly and efficiently.
+- Use one strong information-gathering tool call when current or specific facts are needed, then call done.
+- If two or three information attempts fail or return no useful results, stop and call done instead of looping.
+- Prefer web_search for current facts, basic factual checks, and stale information. Your built-in knowledge may be outdated.
+</speed_mode>`
 	case ModeQuality:
-		return base + "\nQuality mode: perform deep multi-angle research. You usually need several web_search calls unless the question is very simple. Start with broad overview queries, then narrow down with follow-up queries for official reports, timelines, impacts, disputes, statistics, and missing angles. Use __reasoning_preamble before non-done tools. Do not call done until the gathered sources cover the main claims and important gaps."
+		return base + `
+
+<quality_mode>
+- You are a deep-research orchestrator. Follow an iterative reason-act loop.
+- You MUST call __reasoning_preamble before every tool call in this assistant turn, including done. If you do not call it, the following tool call should be treated as invalid.
+- Use up to 10 tool calls total in this turn even though the outer loop may allow more iterations.
+- Unless the question is very simple, aim for 4-7 information-gathering calls across several web_search calls.
+- Start broad, then narrow: overview, official reports, timeline, impact, statistics, disputes, conflicting accounts, missing angles, and reputable local coverage.
+- Each web_search call can contain at most 3 concise queries.
+- Do not call done early. Call done only after the gathered sources cover the main claims, important gaps, and uncertainty.
+- Never output final answer text directly.
+</quality_mode>
+
+<research_strategy>
+1. Start with broad overview queries to establish what happened.
+2. Follow up with targeted searches for official notices, timelines, casualties or damage, transport or infrastructure impact, weather bureau details, and local reporting.
+3. Search for conflicting or updated accounts if the topic is breaking or uncertain.
+4. Stop only when the evidence is broad enough for a sourced answer or when repeated attempts fail.
+</research_strategy>`
 	default:
-		return base + "\nBalanced mode: use __reasoning_preamble before non-done tools and gather enough evidence without over-searching."
+		return base + `
+
+<balanced_mode>
+- You MUST call __reasoning_preamble before every tool call in this assistant turn, including done.
+- Use at most 6 tool calls total: reasoning, 2-3 information-gathering calls when needed, reasoning, and done.
+- Aim for at least two information calls unless the answer is trivial or the first results are clearly sufficient.
+- Do not call done until reasoning plus necessary tool calls are complete.
+- Never output final answer text directly.
+</balanced_mode>`
 	}
 }
 
@@ -601,7 +638,7 @@ func researchActionDescriptions(req ResearchRequest) string {
 	if len(req.FileIDs) > 0 {
 		parts = append(parts, `<tool name="uploads_search">Search uploaded files.</tool>`)
 	}
-	parts = append(parts, `<tool name="scrape_url">Scrape exact URLs when requested or needed for deep reading.</tool>`)
+	parts = append(parts, `<tool name="scrape_url">Scrape exact URLs only when the user explicitly asks about specific web pages. Never call this yourself to get extra information; quality web_search performs deep reading internally.</tool>`)
 	parts = append(parts, `<tool name="done">Signal research completion.</tool>`)
 	return strings.Join(parts, "\n")
 }
@@ -712,17 +749,42 @@ func resultTexts(results []SearchResult) []string {
 }
 
 func dedupeResults(results []SearchResult) []SearchResult {
-	seen := map[string]bool{}
+	seen := map[string]int{}
 	var out []SearchResult
 	for _, result := range results {
 		key := canonicalResultKey(result)
-		if key == "" || seen[key] {
+		if key == "" {
 			continue
 		}
-		seen[key] = true
+		if existing, ok := seen[key]; ok {
+			out[existing] = mergeSearchResult(out[existing], result)
+			continue
+		}
+		seen[key] = len(out)
 		out = append(out, result)
 	}
 	return out
+}
+
+func mergeSearchResult(existing, next SearchResult) SearchResult {
+	if strings.TrimSpace(existing.Title) == "" {
+		existing.Title = next.Title
+	}
+	if strings.TrimSpace(existing.URL) == "" {
+		existing.URL = next.URL
+	}
+	if existing.Source == "" {
+		existing.Source = next.Source
+	}
+	nextContent := strings.TrimSpace(next.Content)
+	if nextContent != "" && !strings.Contains(existing.Content, nextContent) {
+		if strings.TrimSpace(existing.Content) != "" {
+			existing.Content = strings.TrimSpace(existing.Content) + "\n\n" + nextContent
+		} else {
+			existing.Content = nextContent
+		}
+	}
+	return existing
 }
 
 func cosineSimilarity(a, b []float64) float64 {

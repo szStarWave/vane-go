@@ -361,8 +361,89 @@ func TestQualityResearcherPromptRequiresMultiRoundSearch(t *testing.T) {
 		Mode:    ModeQuality,
 		Sources: []SearchSource{SearchSourceWeb},
 	}, 0, defaultMaxIterations(ModeQuality))
-	if !strings.Contains(prompt, "several web_search calls") || !strings.Contains(prompt, "Start with broad overview queries") {
+	if !strings.Contains(prompt, "aim for 4-7 information-gathering calls") ||
+		!strings.Contains(prompt, "You MUST call __reasoning_preamble before every tool call") ||
+		!strings.Contains(prompt, "Start broad, then narrow") {
 		t.Fatalf("quality researcher prompt missing multi-round guidance: %s", prompt)
+	}
+}
+
+func TestBalancedResearcherPromptRequiresReasoningPreamble(t *testing.T) {
+	prompt := getResearcherPrompt(ResearchRequest{
+		Query: "recent model comparison",
+		Classification: Classification{
+			ShouldSearch:       true,
+			StandaloneFollowUp: "recent model comparison",
+			Sources:            []SearchSource{SearchSourceWeb},
+		},
+		Mode:    ModeBalanced,
+		Sources: []SearchSource{SearchSourceWeb},
+	}, 0, defaultMaxIterations(ModeBalanced))
+	if !strings.Contains(prompt, "You MUST call __reasoning_preamble before every tool call") ||
+		!strings.Contains(prompt, "Use at most 6 tool calls total") {
+		t.Fatalf("balanced researcher prompt missing original-style tool guidance: %s", prompt)
+	}
+}
+
+func TestScrapeURLPromptRequiresExplicitUserURL(t *testing.T) {
+	prompt := researchActionDescriptions(ResearchRequest{
+		Query: "Harbin tornado impacts",
+		Classification: Classification{
+			ShouldSearch:       true,
+			StandaloneFollowUp: "Harbin tornado impacts",
+			Sources:            []SearchSource{SearchSourceWeb},
+		},
+		Mode:    ModeQuality,
+		Sources: []SearchSource{SearchSourceWeb},
+	})
+	if !strings.Contains(prompt, "only when the user explicitly asks about specific web pages") ||
+		strings.Contains(prompt, "needed for deep reading") {
+		t.Fatalf("scrape_url description should match original explicit-URL constraint: %s", prompt)
+	}
+}
+
+func TestDedupeResultsMergesDuplicateURLContent(t *testing.T) {
+	results := dedupeResults([]SearchResult{
+		{Title: "Report", URL: "https://example.com/news#top", Content: "First snippet.", Source: SearchSourceWeb},
+		{Title: "Report duplicate", URL: "https://example.com/news", Content: "Second snippet.", Source: SearchSourceWeb},
+	})
+	if len(results) != 1 {
+		t.Fatalf("dedupeResults length = %d, want 1: %#v", len(results), results)
+	}
+	if !strings.Contains(results[0].Content, "First snippet.") || !strings.Contains(results[0].Content, "Second snippet.") {
+		t.Fatalf("dedupeResults did not merge duplicate URL content: %#v", results[0])
+	}
+}
+
+func TestResearcherToolLoopMergesDuplicateURLContent(t *testing.T) {
+	searcher := &duplicateURLSearchProvider{}
+	researchModel := &scriptedResearchModel{calls: [][]model.ToolCall{
+		{toolCall("search-1", "web_search", map[string]any{"queries": []string{"first angle"}})},
+		{toolCall("search-2", "web_search", map[string]any{"queries": []string{"second angle"}})},
+		{toolCall("done-1", "done", map[string]any{})},
+	}}
+	researcher := Researcher{
+		ResearchModel:  researchModel,
+		SearchProvider: searcher,
+	}
+	results, err := researcher.Research(context.Background(), ResearchRequest{
+		Query: "storm impacts",
+		Classification: Classification{
+			ShouldSearch:       true,
+			StandaloneFollowUp: "storm impacts",
+			Sources:            []SearchSource{SearchSourceWeb},
+		},
+		Mode:    ModeBalanced,
+		Sources: []SearchSource{SearchSourceWeb},
+	})
+	if err != nil {
+		t.Fatalf("Research: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("results length = %d, want merged single URL: %#v", len(results), results)
+	}
+	if !strings.Contains(results[0].Content, "first angle") || !strings.Contains(results[0].Content, "second angle") {
+		t.Fatalf("merged result content = %q, want both search angles", results[0].Content)
 	}
 }
 
@@ -446,6 +527,17 @@ type alwaysFailingSearchProvider struct {
 func (p *alwaysFailingSearchProvider) Search(_ context.Context, query string, _ SearchOptions) ([]SearchResult, error) {
 	p.queries = append(p.queries, query)
 	return nil, errors.New("search backend unavailable")
+}
+
+type duplicateURLSearchProvider struct{}
+
+func (p *duplicateURLSearchProvider) Search(_ context.Context, query string, opts SearchOptions) ([]SearchResult, error) {
+	return []SearchResult{{
+		Title:   "Storm report",
+		URL:     "https://example.com/storm",
+		Content: "snippet from " + query,
+		Source:  opts.Source,
+	}}, nil
 }
 
 func (m *staticTextModel) Info() model.Info { return model.Info{Name: "static"} }
