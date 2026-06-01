@@ -27,6 +27,7 @@ type SearchAgentRequest struct {
 	Sources       []SearchSource
 	FileIDs       []string
 	MaxIterations int
+	Now           time.Time
 }
 
 type SearchAgentResult struct {
@@ -72,6 +73,7 @@ func (a SearchAgent) Run(ctx context.Context, req SearchAgentRequest) (SearchAge
 		Sources:       classification.Sources,
 		FileIDs:       req.FileIDs,
 		MaxIterations: req.MaxIterations,
+		Now:           req.Now,
 	})
 	emitSearchEvent(ctx, a.OnSearchEvent, SearchEvent{
 		Type:        SearchEventSourceBlock,
@@ -383,6 +385,7 @@ type ResearchRequest struct {
 	Sources       []SearchSource
 	FileIDs       []string
 	MaxIterations int
+	Now           time.Time
 }
 
 func (r Researcher) Research(ctx context.Context, req ResearchRequest) ([]SearchResult, error) {
@@ -390,7 +393,7 @@ func (r Researcher) Research(ctx context.Context, req ResearchRequest) ([]Search
 	if iterations <= 0 {
 		iterations = defaultMaxIterations(req.Mode)
 	}
-	queries := buildResearchQueries(req.Query, req.Mode, iterations)
+	queries := buildResearchQueries(req.Query, req.Mode, iterations, req.Now)
 	emitSearchEvent(ctx, r.OnSearchEvent, SearchEvent{
 		Type:       SearchEventStart,
 		Mode:       req.Mode,
@@ -533,7 +536,8 @@ func (r Researcher) runAction(ctx context.Context, req ResearchRequest, source S
 	}
 }
 
-func buildResearchQueries(query string, mode Mode, iterations int) []string {
+func buildResearchQueries(query string, mode Mode, iterations int, now time.Time) []string {
+	query = resolveRelativeDateQuery(query, now)
 	base := buildQueries(query, mode)
 	extras := []string{
 		query + " key facts",
@@ -567,6 +571,39 @@ func buildResearchQueries(query string, mode Mode, iterations int) []string {
 		return queries[:iterations]
 	}
 	return queries
+}
+
+func resolveRelativeDateQuery(query string, now time.Time) string {
+	if strings.TrimSpace(query) == "" {
+		return query
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	yesterday := now.AddDate(0, 0, -1)
+	dateText := fmt.Sprintf("%d\u5e74%d\u6708%d\u65e5", yesterday.Year(), int(yesterday.Month()), yesterday.Day())
+	replacements := []struct {
+		from string
+		to   string
+	}{
+		{from: "\u6628\u65e5", to: dateText},
+		{from: "\u6628\u5929", to: dateText},
+		{from: "yesterday", to: yesterday.Format("2006-01-02")},
+	}
+	out := query
+	for _, replacement := range replacements {
+		out = strings.ReplaceAll(out, replacement.from, replacement.to)
+		out = strings.ReplaceAll(out, strings.ToUpper(replacement.from), replacement.to)
+		out = strings.ReplaceAll(out, titleASCII(replacement.from), replacement.to)
+	}
+	return out
+}
+
+func titleASCII(value string) string {
+	if value == "" {
+		return ""
+	}
+	return strings.ToUpper(value[:1]) + value[1:]
 }
 
 func defaultMaxIterations(mode Mode) int {

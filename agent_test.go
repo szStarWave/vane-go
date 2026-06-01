@@ -54,11 +54,57 @@ func TestResearcherUsesModeIterationCounts(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(string(tt.mode), func(t *testing.T) {
-			queries := buildResearchQueries("vane", tt.mode, defaultMaxIterations(tt.mode))
+			queries := buildResearchQueries("vane", tt.mode, defaultMaxIterations(tt.mode), time.Time{})
 			if len(queries) != tt.want {
 				t.Fatalf("query count = %d, want %d: %#v", len(queries), tt.want, queries)
 			}
 		})
+	}
+}
+
+func TestResearchQueriesResolveHarbinYesterdayWindQuestion(t *testing.T) {
+	now := time.Date(2026, 6, 1, 10, 0, 0, 0, time.UTC)
+	query := "搜索哈尔滨昨日的大风，看看出现了哪些重大事故，分析一下带来了哪些影响"
+	queries := buildResearchQueries(query, ModeQuality, 25, now)
+	if len(queries) == 0 {
+		t.Fatal("expected research queries")
+	}
+	first := queries[0]
+	if strings.Contains(first, "昨日") || strings.Contains(first, "昨天") {
+		t.Fatalf("query still contains relative date: %q", first)
+	}
+	if !strings.Contains(first, "2026年5月31日") {
+		t.Fatalf("query = %q, want absolute date 2026年5月31日", first)
+	}
+	if !strings.Contains(first, "哈尔滨") || !strings.Contains(first, "大风") {
+		t.Fatalf("query = %q, want Harbin wind terms", first)
+	}
+}
+
+func TestSearchAgentHarbinQuestionUsesAbsoluteDateQueries(t *testing.T) {
+	now := time.Date(2026, 6, 1, 10, 0, 0, 0, time.UTC)
+	searcher := &recordingSearchProvider{}
+	agent := SearchAgent{SearchProvider: searcher}
+	_, err := agent.Run(context.Background(), SearchAgentRequest{
+		Query:         "搜索哈尔滨昨日的大风，看看出现了哪些重大事故，分析一下带来了哪些影响",
+		Mode:          ModeQuality,
+		Sources:       []SearchSource{SearchSourceWeb},
+		MaxIterations: 2,
+		Now:           now,
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(searcher.queries) == 0 {
+		t.Fatal("expected search queries")
+	}
+	for _, query := range searcher.queries {
+		if strings.Contains(query, "昨日") || strings.Contains(query, "昨天") {
+			t.Fatalf("search query still contains relative date: %q", query)
+		}
+	}
+	if !strings.Contains(searcher.queries[0], "2026年5月31日") {
+		t.Fatalf("first query = %q, want absolute date", searcher.queries[0])
 	}
 }
 
@@ -134,6 +180,19 @@ func TestLLMClassifierFallsBackOnInvalidJSON(t *testing.T) {
 
 type staticTextModel struct {
 	text string
+}
+
+type recordingSearchProvider struct {
+	queries []string
+}
+
+func (p *recordingSearchProvider) Search(_ context.Context, query string, _ SearchOptions) ([]SearchResult, error) {
+	p.queries = append(p.queries, query)
+	return []SearchResult{{
+		Title:   "哈尔滨强对流天气",
+		URL:     "https://example.com/harbin-tornado",
+		Content: "2026年5月31日哈尔滨出现大风和龙卷风相关报道。",
+	}}, nil
 }
 
 func (m *staticTextModel) Info() model.Info { return model.Info{Name: "static"} }

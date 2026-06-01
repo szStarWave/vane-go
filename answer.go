@@ -49,6 +49,7 @@ func Answer(ctx context.Context, req Request) (<-chan *model.Response, error) {
 		Sources:       req.Sources,
 		FileIDs:       req.FileIDs,
 		MaxIterations: req.MaxIterations,
+		Now:           req.Now,
 	})
 	if err != nil || len(result.Sources) == 0 {
 		if err != nil {
