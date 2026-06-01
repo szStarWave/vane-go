@@ -9,8 +9,8 @@ github.com/pmezard/go-difflib v1.0.0 h1:4DBwDE0NGyQoBHbLQYPwSUPoCMWR5BEzIk/f1lZb
 github.com/pmezard/go-difflib v1.0.0/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=
 github.com/stretchr/testify v1.10.0 h1:Xv5erBjTwe/5IxqUQTdXv5kgmIvbHo3QQyRwhJsOfJA=
 github.com/stretchr/testify v1.10.0/go.mod h1:r2ic/lqez/lEtzL7wO/rwa5dbSLXVDPFyf8C91i36aY=
-github.com/szStarWave/websurfx-go v0.1.0 h1:b91yQaXVuRrea1VCiqK3DqQFmOqRZPi6A1lM+yTAa8s=
-github.com/szStarWave/websurfx-go v0.1.0/go.mod h1:r38MqMdJXeuNzOCN2mDPPViAb08RQW4YSyaWNDS+VTo=
+github.com/szStarWave/websurfx-go v0.1.1 h1:cuEGVkYWxNJEtwmsRy3EquL/4kiqR5pCyZcnzJWLVFI=
+github.com/szStarWave/websurfx-go v0.1.1/go.mod h1:r38MqMdJXeuNzOCN2mDPPViAb08RQW4YSyaWNDS+VTo=
 github.com/yuin/goldmark v1.4.13/go.mod h1:6yULJ656Px+3vBD8DxQVa3kxgyrAnzto9xy5taEt/CY=
 go.uber.org/goleak v1.3.0 h1:2K3zAYmnTNqV73imy9J1T3WC+gmCePx2hEGkimedGto=
 go.uber.org/goleak v1.3.0/go.mod h1:CoHD4mav9JJNrW/WLlf7HGZPjdw8EucARQHekz1X6bE=
