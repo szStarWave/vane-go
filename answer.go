@@ -35,8 +35,21 @@ func Answer(ctx context.Context, req Request) (<-chan *model.Response, error) {
 	if mode == "" {
 		mode = ModeBalanced
 	}
-	searchResults, err := gatherSearchResults(ctx, provider, query, mode, req.OnSearchEvent)
-	if err != nil || len(searchResults) == 0 {
+	agent := SearchAgent{
+		SearchProvider:    provider,
+		EmbeddingProvider: req.EmbeddingProvider,
+		WidgetProviders:   req.WidgetProviders,
+		OnSearchEvent:     req.OnSearchEvent,
+	}
+	result, err := agent.Run(ctx, SearchAgentRequest{
+		Query:         query,
+		Messages:      req.Messages,
+		Mode:          mode,
+		Sources:       req.Sources,
+		FileIDs:       req.FileIDs,
+		MaxIterations: req.MaxIterations,
+	})
+	if err != nil || len(result.Sources) == 0 {
 		if err != nil {
 			notifySearchError(req.OnSearchError, err)
 			emitSearchEvent(ctx, req.OnSearchEvent, SearchEvent{
@@ -60,12 +73,28 @@ func Answer(ctx context.Context, req Request) (<-chan *model.Response, error) {
 	if genConfig.Temperature == nil {
 		genConfig.Temperature = floatPtr(0.4)
 	}
+	emitSearchEvent(ctx, req.OnSearchEvent, SearchEvent{
+		Type:        SearchEventWriterStart,
+		Mode:        mode,
+		Query:       query,
+		ResultCount: len(result.Sources),
+	})
 	writerReq := &model.Request{
-		Messages:         buildWriterMessages(req.Messages, searchResults, req.SystemInstructions, mode, now),
+		Messages:         buildWriterMessages(req.Messages, result.Sources, result.Widgets, req.SystemInstructions, mode, now),
 		GenerationConfig: genConfig,
 		ExtraFields:      req.ExtraFields,
 	}
-	return req.Model.GenerateContent(ctx, writerReq)
+	ch, err := req.Model.GenerateContent(ctx, writerReq)
+	if err != nil {
+		emitSearchEvent(ctx, req.OnSearchEvent, SearchEvent{
+			Type:  SearchEventError,
+			Mode:  mode,
+			Query: query,
+			Error: err.Error(),
+		})
+		return nil, err
+	}
+	return wrapWriterEvents(ctx, ch, req.OnSearchEvent, mode, query), nil
 }
 
 func fallbackGenerate(ctx context.Context, m model.Model, messages []model.Message, cfg *model.GenerationConfig) <-chan *model.Response {
@@ -221,8 +250,8 @@ func totalResultLimit(mode Mode) int {
 	}
 }
 
-func buildWriterMessages(messages []model.Message, results []SearchResult, instructions string, mode Mode, now time.Time) []model.Message {
-	writerPrompt := getWriterPrompt(formatSearchContext(results), instructions, mode, now)
+func buildWriterMessages(messages []model.Message, results []SearchResult, widgets []WidgetResult, instructions string, mode Mode, now time.Time) []model.Message {
+	writerPrompt := getWriterPrompt(formatSearchContext(results), formatWidgetContext(widgets), instructions, mode, now)
 	out := make([]model.Message, 0, len(messages)+1)
 	out = append(out, model.Message{Role: model.RoleSystem, Content: writerPrompt})
 	for _, msg := range messages {
@@ -248,22 +277,38 @@ func formatSearchContext(results []SearchResult) string {
 	return b.String()
 }
 
-func getWriterPrompt(contextText, systemInstructions string, mode Mode, now time.Time) string {
+func formatWidgetContext(widgets []WidgetResult) string {
+	if len(widgets) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString(`<widgets note="Structured widget outputs. Use when relevant and do not cite as web sources unless also supported by search results.">`)
+	b.WriteString("\n")
+	for i, widget := range widgets {
+		fmt.Fprintf(&b, `<widget index="%d" kind="%s" title="%s">%s</widget>`+"\n", i+1, xmlishEscape(string(widget.Kind)), xmlishEscape(widget.Title), xmlishEscape(firstNonEmpty(widget.Content, widget.Error)))
+	}
+	b.WriteString("</widgets>")
+	return b.String()
+}
+
+func getWriterPrompt(contextText, widgetText, systemInstructions string, mode Mode, now time.Time) string {
 	depth := ""
 	if mode == ModeQuality {
-		depth = "\n- You are in quality search mode: provide a deeper, more comprehensive answer when the sources support it."
+		depth = "\n- Quality mode: provide a deeper, more comprehensive answer when the sources support it, compare evidence, and call out uncertainty."
 	}
 	if mode == ModeSpeed {
-		depth = "\n- You are in speed search mode: answer concisely and prioritize the most relevant source facts."
+		depth = "\n- Speed mode: answer concisely and prioritize the most relevant source facts."
 	}
-	return fmt.Sprintf(`You are Vane, an AI answering engine skilled in web search and source-grounded answers.
+	return fmt.Sprintf(`You are Vane, an AI answering engine skilled in web research, source analysis, and precise answers.
 
 Your task:
-- Answer the user's latest question using the provided web context.
+- Answer the user's latest question using the provided research context.
 - Use Markdown for clear structure.
-- Cite source-backed claims with [number] notation matching the result index.
+- Cite source-backed claims with [number] notation matching the search result index.
+- Every paragraph that relies on web facts should include citations.
 - If the context is insufficient, say what is missing instead of inventing facts.
-- Do not cite facts that are not supported by the context.%s
+- Do not cite facts that are not supported by the context.
+- Prefer direct, useful answers over explaining the search process.%s
 
 User instructions:
 %s
@@ -272,7 +317,8 @@ Current date and time (UTC): %s
 
 <context>
 %s
-</context>`, depth, strings.TrimSpace(systemInstructions), now.Format(time.RFC3339), contextText)
+%s
+</context>`, depth, strings.TrimSpace(systemInstructions), now.Format(time.RFC3339), contextText, widgetText)
 }
 
 func latestUserText(messages []model.Message) string {
@@ -298,6 +344,48 @@ func messageText(msg model.Message) string {
 		}
 	}
 	return strings.TrimSpace(strings.Join(parts, "\n"))
+}
+
+func wrapWriterEvents(ctx context.Context, in <-chan *model.Response, handler func(context.Context, SearchEvent), mode Mode, query string) <-chan *model.Response {
+	if handler == nil {
+		return in
+	}
+	out := make(chan *model.Response)
+	go func() {
+		defer close(out)
+		for rsp := range in {
+			if text := responseText(rsp); text != "" {
+				emitSearchEvent(ctx, handler, SearchEvent{
+					Type:    SearchEventWriterDelta,
+					Mode:    mode,
+					Query:   query,
+					Message: text,
+				})
+			}
+			if rsp != nil && rsp.Done {
+				emitSearchEvent(ctx, handler, SearchEvent{
+					Type:  SearchEventWriterEnd,
+					Mode:  mode,
+					Query: query,
+				})
+			}
+			out <- rsp
+		}
+	}()
+	return out
+}
+
+func responseText(rsp *model.Response) string {
+	if rsp == nil {
+		return ""
+	}
+	var parts []string
+	for _, choice := range rsp.Choices {
+		if strings.TrimSpace(choice.Message.Content) != "" {
+			parts = append(parts, choice.Message.Content)
+		}
+	}
+	return strings.TrimSpace(strings.Join(parts, ""))
 }
 
 func canonicalResultKey(result SearchResult) string {

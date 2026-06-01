@@ -37,6 +37,11 @@ func (m *AnsweringModel) GenerateContent(ctx context.Context, request *model.Req
 		Mode:               mode,
 		SystemInstructions: m.SystemInstructions,
 		SearchProvider:     m.SearchProvider,
+		Sources:            m.Sources,
+		FileIDs:            m.FileIDs,
+		EmbeddingProvider:  m.EmbeddingProvider,
+		WidgetProviders:    m.WidgetProviders,
+		MaxIterations:      m.MaxIterations,
 		OnSearchError:      m.OnSearchError,
 		OnSearchEvent:      m.OnSearchEvent,
 	})
