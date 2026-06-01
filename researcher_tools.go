@@ -273,9 +273,9 @@ func (r Researcher) queryTool(req ResearchRequest, name string, source SearchSou
 			return res, err
 		},
 		function.WithName(name),
-		function.WithDescription(description+" Provide up to 3 SEO-friendly keyword queries."),
+		function.WithDescription(description),
 		function.WithInputSchema(&tool.Schema{Type: "object", Required: []string{"queries"}, Properties: map[string]*tool.Schema{
-			"queries": {Type: "array", Description: "Search queries, maximum 3.", Items: &tool.Schema{Type: "string"}},
+			"queries": {Type: "array", Description: "Search queries, maximum 3. Use targeted SEO-friendly keywords, not full natural-language sentences.", Items: &tool.Schema{Type: "string"}},
 		}}),
 	)
 }
@@ -330,7 +330,7 @@ func (r Researcher) executeQueries(ctx context.Context, req ResearchRequest, sou
 	if len(queries) == 0 {
 		queries = []string{firstNonEmpty(req.Classification.StandaloneFollowUp, req.Query)}
 	}
-	queries = r.planSearchQueries(ctx, req, source, queries)
+	queries = uniqueStrings(queries)
 	if len(queries) > 3 {
 		queries = queries[:3]
 	}
@@ -357,85 +357,6 @@ func (r Researcher) executeQueries(ctx context.Context, req ResearchRequest, sou
 		all = all[:totalResultLimit(req.Mode)]
 	}
 	return all, firstErr
-}
-
-func (r Researcher) planSearchQueries(ctx context.Context, req ResearchRequest, source SearchSource, candidates []string) []string {
-	candidates = uniqueStrings(candidates)
-	if len(candidates) == 0 || r.ResearchModel == nil || source == SearchSourceUploads {
-		return candidates
-	}
-	now := time.Now()
-	if !req.Now.IsZero() {
-		now = req.Now
-	}
-	var b strings.Builder
-	for i, query := range candidates {
-		fmt.Fprintf(&b, "%d. %s\n", i+1, resolveRelativeDateQuery(query, req.Now))
-	}
-	ch, err := r.ResearchModel.GenerateContent(ctx, &model.Request{
-		Messages: []model.Message{
-			model.NewSystemMessage(`You are Vane's search query planner. Return compact JSON only: {"queries":["..."]}.
-Rewrite candidate queries into search-engine-friendly keyword queries.
-Rules:
-- Return 1 to 3 queries.
-- Do not return full natural-language sentences.
-- Preserve the user's entities, locations, absolute dates/time ranges, and core constraints.
-- Split complex requests into complementary angles instead of repeating the same query.
-- Keep each query short and specific.
-- Use the user's language unless another language is necessary for the topic.`),
-			model.NewUserMessage(fmt.Sprintf(
-				"Current date: %s\nMode: %s\nSource: %s\nUser query: %s\nStandalone question: %s\nCandidate queries:\n%s",
-				now.Format("2006-01-02"),
-				req.Mode,
-				source,
-				req.Query,
-				firstNonEmpty(req.Classification.StandaloneFollowUp, req.Query),
-				b.String(),
-			)),
-		},
-		GenerationConfig: model.GenerationConfig{Stream: false, Temperature: floatPtr(0), MaxTokens: intPtr(220)},
-	})
-	if err != nil {
-		return limitSearchQueries(candidates)
-	}
-	text, err := collectResponseText(ctx, ch)
-	if err != nil {
-		return limitSearchQueries(candidates)
-	}
-	var parsed struct {
-		Queries []string `json:"queries"`
-	}
-	if err := json.Unmarshal([]byte(extractJSONObject(text)), &parsed); err != nil {
-		return limitSearchQueries(candidates)
-	}
-	planned := sanitizePlannedQueries(parsed.Queries)
-	if len(planned) == 0 {
-		return limitSearchQueries(candidates)
-	}
-	return planned
-}
-
-func limitSearchQueries(queries []string) []string {
-	queries = uniqueStrings(queries)
-	if len(queries) > 3 {
-		return queries[:3]
-	}
-	return queries
-}
-
-func sanitizePlannedQueries(queries []string) []string {
-	var out []string
-	for _, query := range queries {
-		query = strings.TrimSpace(query)
-		if query == "" || len([]rune(query)) > 96 {
-			continue
-		}
-		out = append(out, query)
-		if len(out) >= 3 {
-			break
-		}
-	}
-	return uniqueStrings(out)
 }
 
 func (r Researcher) rankAndDedupe(ctx context.Context, queries []string, results []SearchResult, mode Mode) []SearchResult {
@@ -764,17 +685,13 @@ func researchActionDescriptions(req ResearchRequest) string {
 		parts = append(parts, `<tool name="__reasoning_preamble">State a concise natural-language plan before other tools.</tool>`)
 	}
 	if hasSource(req.Sources, SearchSourceWeb) {
-		if req.Mode == ModeQuality {
-			parts = append(parts, `<tool name="web_search">Search the web for current or factual information. In quality mode, call this tool several times as needed: start broad, then narrow to official reports, timeline, impacts, statistics, and conflicting accounts. Provide up to 3 concise queries per call.</tool>`)
-		} else {
-			parts = append(parts, `<tool name="web_search">Search the web for current or factual information.</tool>`)
-		}
+		parts = append(parts, fmt.Sprintf(`<tool name="web_search">%s</tool>`, webSearchActionDescription(req.Mode)))
 	}
 	if hasSource(req.Sources, SearchSourceAcademic) && req.Classification.AcademicSearch {
-		parts = append(parts, `<tool name="academic_search">Search academic, paper, benchmark, study, official report, or research sources.</tool>`)
+		parts = append(parts, `<tool name="academic_search">Use this tool to perform academic searches for scholarly articles, papers, and research studies relevant to the user's query. Provide up to 3 concise search queries. Make sure the queries are specific and relevant to the user's needs.</tool>`)
 	}
 	if hasSource(req.Sources, SearchSourceDiscussions) && req.Classification.DiscussionSearch {
-		parts = append(parts, `<tool name="social_search">Search forums, issues, community feedback, and discussion sources.</tool>`)
+		parts = append(parts, `<tool name="social_search">Use this tool to perform social media searches for relevant posts, discussions, and trends related to the user's query. Provide up to 3 concise search queries. Make sure the queries are specific and relevant to the user's needs.</tool>`)
 	}
 	if len(req.FileIDs) > 0 {
 		parts = append(parts, `<tool name="uploads_search">Search uploaded files.</tool>`)
@@ -782,6 +699,40 @@ func researchActionDescriptions(req ResearchRequest) string {
 	parts = append(parts, `<tool name="scrape_url">Scrape exact URLs only when the user explicitly asks about specific web pages. Never call this yourself to get extra information; quality web_search performs deep reading internally.</tool>`)
 	parts = append(parts, `<tool name="done">Signal research completion.</tool>`)
 	return strings.Join(parts, "\n")
+}
+
+func webSearchActionDescription(mode Mode) string {
+	common := `Use this tool to perform web searches based on the provided queries. This is useful when you need to gather information from the web to answer the user's questions. You can provide up to 3 queries at a time. You will have to use this every single time if this is present and relevant.
+
+Your queries should be very targeted and specific to the information you need, avoid broad or generic queries.
+Your queries shouldn't be sentences but rather keywords that are SEO friendly and can be used to search the web for information.
+
+You can search for 3 queries in one go, make sure to utilize all 3 queries to maximize the information you can gather. If a question is simple, then split your queries to cover different aspects or related topics to get a comprehensive understanding.`
+	switch mode {
+	case ModeSpeed:
+		return common + `
+You are currently on speed mode, meaning you would only get to call this tool once. Make sure to prioritize the most important queries that are likely to get you the needed information in one go.
+For example, if the user is asking about the features of a new technology, you might use queries like "GPT-5.1 features", "GPT-5.1 release date", "GPT-5.1 improvements" rather than a broad query like "Tell me about GPT-5.1".
+If this tool is present and no other tools are more relevant, you MUST use this tool to get the needed information.`
+	case ModeQuality:
+		return common + `
+You have to call this tool several times to gather enough information unless the question is very simple (like greeting questions or basic facts).
+Start initially with broader queries to get an overview, then narrow down with more specific queries based on the results you receive.
+Never stop before at least 5-6 iterations of searches unless the user question is very simple.
+If this tool is present and no other tools are more relevant, you MUST use this tool to get the needed information. You can call this tool multiple times as needed.`
+	default:
+		return common + `
+You can call this tool several times if needed to gather enough information.
+Start initially with broader queries to get an overview, then narrow down with more specific queries based on the results you receive.
+For example if the user is asking about Tesla, your actions should be like:
+1. __reasoning_preamble "The user is asking about Tesla. I will start with broader queries to get an overview of Tesla, then narrow down with more specific queries based on the results I receive." then
+2. web_search ["Tesla", "Tesla latest news", "Tesla stock price"] then
+3. __reasoning_preamble "Based on the previous search results, I will now narrow down my queries to focus on Tesla's recent developments and stock performance." then
+4. web_search ["Tesla Q2 2025 earnings", "Tesla new model 2025", "Tesla stock analysis"] then done.
+5. __reasoning_preamble "I have gathered enough information to provide a comprehensive answer."
+6. done.
+If this tool is present and no other tools are more relevant, you MUST use this tool to get the needed information. You can call this tool multiple times as needed.`
+	}
 }
 
 func collectToolCalls(ctx context.Context, ch <-chan *model.Response) ([]model.ToolCall, error) {
