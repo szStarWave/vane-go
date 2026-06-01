@@ -101,6 +101,11 @@ func TestTemporalQueryExpanderAddsEventImpactVariants(t *testing.T) {
 	if !strings.Contains(joined, "\u5b98\u65b9\u901a\u62a5") || !strings.Contains(joined, "\u4f24\u4ea1") {
 		t.Fatalf("queries missing disaster/impact variants: %#v", queries)
 	}
+	for _, query := range queries {
+		if !containsCJK(query) {
+			t.Fatalf("Chinese research query drifted to non-Chinese: %q in %#v", query, queries)
+		}
+	}
 }
 
 func TestTemporalReplacementOnlyReplacesMatchedPhrase(t *testing.T) {
@@ -464,6 +469,47 @@ func TestChineseVerboseSearchQueryIsRepaired(t *testing.T) {
 	for _, query := range searcher.queries {
 		if looksLikeVerboseSearchQuery(query) {
 			t.Fatalf("repaired query still verbose: %q", query)
+		}
+	}
+}
+
+func TestChineseSearchQueriesRejectEnglishRepair(t *testing.T) {
+	searcher := &recordingSearchProvider{}
+	researchModel := &scriptedResearchModel{
+		queryRepair: []string{
+			"Harbin May 31 2026 tornado official report",
+			"Harbin storm accident casualties",
+			"Harbin severe weather impact traffic power outage",
+		},
+		calls: [][]model.ToolCall{
+			{toolCall("search-1", "web_search", map[string]any{"queries": []string{"搜索哈尔滨2026年5月31日的大风，看看出现了哪些重大事故，分析影响"}})},
+			{toolCall("done-1", "done", map[string]any{})},
+		},
+	}
+	researcher := Researcher{ResearchModel: researchModel, SearchProvider: searcher}
+	_, err := researcher.Research(context.Background(), ResearchRequest{
+		Query: "搜索哈尔滨昨日的大风，看看出现了哪些重大事故，分析一下带来了哪些影响",
+		Classification: Classification{
+			ShouldSearch:       true,
+			StandaloneFollowUp: "搜索哈尔滨昨日的大风事故及影响",
+			Sources:            []SearchSource{SearchSourceWeb},
+		},
+		Mode:    ModeQuality,
+		Sources: []SearchSource{SearchSourceWeb},
+		Now:     time.Date(2026, 6, 1, 10, 0, 0, 0, time.FixedZone("CST", 8*60*60)),
+	})
+	if err != nil {
+		t.Fatalf("Research: %v", err)
+	}
+	if len(searcher.queries) == 0 {
+		t.Fatal("expected fallback Chinese search queries")
+	}
+	for _, query := range searcher.queries {
+		if !containsCJK(query) {
+			t.Fatalf("query = %q, want Chinese fallback query; all=%#v", query, searcher.queries)
+		}
+		if containsAnyFold(query, "Harbin", "tornado", "official report", "casualties", "power outage") {
+			t.Fatalf("query = %q, leaked English repaired query; all=%#v", query, searcher.queries)
 		}
 	}
 }

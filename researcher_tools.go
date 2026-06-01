@@ -413,6 +413,7 @@ func (r Researcher) executeQueries(ctx context.Context, req ResearchRequest, sou
 	}
 	queries = uniqueStrings(queries)
 	queries = r.repairSearchQueries(ctx, req, source, queries)
+	queries = preserveSearchQueryLanguage(req, queries)
 	if len(queries) > 3 {
 		queries = queries[:3]
 	}
@@ -460,7 +461,7 @@ func (r Researcher) executeQueries(ctx context.Context, req ResearchRequest, sou
 
 func (r Researcher) repairSearchQueries(ctx context.Context, req ResearchRequest, source SearchSource, queries []string) []string {
 	if r.ResearchModel == nil || source == SearchSourceUploads || !needsQueryRepair(queries) {
-		return queries
+		return preserveSearchQueryLanguage(req, queries)
 	}
 	now := time.Now()
 	if !req.Now.IsZero() {
@@ -476,7 +477,8 @@ func (r Researcher) repairSearchQueries(ctx context.Context, req ResearchRequest
 Only rewrite bad search queries that look like full user sentences or verbose conversational text.
 Return 1 to 3 search-engine-friendly keyword queries.
 Preserve entities, locations, dates, and constraints.
-Use short Chinese keyword queries for Chinese local/news questions.
+Preserve the user's query language. If the user query is Chinese, every rewritten query MUST stay Chinese unless the user explicitly asks for English/global sources.
+Use short Chinese keyword queries for Chinese local/news questions. Do not translate Chinese place names, event terms, dates, or constraints into English.
 If the input queries are already good keyword queries, return them unchanged.`),
 			model.NewUserMessage(fmt.Sprintf(
 				"Current date: %s\nMode: %s\nSource: %s\nUser query: %s\nStandalone question: %s\nQueries to repair:\n%s",
@@ -505,9 +507,9 @@ If the input queries are already good keyword queries, return them unchanged.`),
 	}
 	repaired := sanitizeRepairedQueries(parsed.Queries)
 	if len(repaired) == 0 {
-		return queries
+		return preserveSearchQueryLanguage(req, queries)
 	}
-	return repaired
+	return preserveSearchQueryLanguage(req, repaired)
 }
 
 func needsQueryRepair(queries []string) bool {
@@ -548,6 +550,121 @@ func sanitizeRepairedQueries(queries []string) []string {
 		}
 	}
 	return uniqueStrings(out)
+}
+
+func preserveSearchQueryLanguage(req ResearchRequest, queries []string) []string {
+	if !prefersChineseSearch(req) {
+		return uniqueStrings(queries)
+	}
+	fallbacks := chineseSearchFallbackQueries(req)
+	out := make([]string, 0, len(queries))
+	for _, query := range queries {
+		query = strings.TrimSpace(query)
+		if query == "" {
+			continue
+		}
+		if queryLanguageCompatible(req, query) {
+			out = append(out, query)
+		}
+	}
+	out = uniqueStrings(out)
+	if len(out) > 0 {
+		return out
+	}
+	return fallbacks
+}
+
+func queryLanguageCompatible(req ResearchRequest, query string) bool {
+	if !prefersChineseSearch(req) {
+		return true
+	}
+	return containsCJK(query) || containsAnyFold(query,
+		"site:.cn", "site:gov.cn", "gov.cn",
+		"cctv", "xinhua", "china daily", "people.cn",
+	)
+}
+
+func prefersChineseSearch(req ResearchRequest) bool {
+	if containsAnyFold(req.Query, "english", "英文", "global source", "international source") {
+		return false
+	}
+	return containsCJK(req.Query) || containsCJK(req.Classification.StandaloneFollowUp)
+}
+
+func chineseSearchFallbackQueries(req ResearchRequest) []string {
+	query := strings.TrimSpace(firstNonEmpty(req.Classification.StandaloneFollowUp, req.Query))
+	query = resolveRelativeDateQuery(query, req.Now)
+	if query == "" {
+		return nil
+	}
+	out := []string{query}
+	if looksLikeVerboseSearchQuery(query) {
+		out = compactChineseQueryFallback(query)
+	}
+	if len(out) == 0 {
+		out = []string{query}
+	}
+	return uniqueStrings(out)
+}
+
+func compactChineseQueryFallback(query string) []string {
+	fields := chineseKeywordFields(query)
+	if len(fields) == 0 {
+		return []string{query}
+	}
+	base := strings.Join(fields, " ")
+	out := []string{base}
+	for _, suffix := range []string{"官方通报", "事故 伤亡", "影响 损失"} {
+		if !containsAny(base, suffix) {
+			out = append(out, base+" "+suffix)
+		}
+	}
+	return out
+}
+
+func chineseKeywordFields(query string) []string {
+	var fields []string
+	for _, token := range strings.FieldsFunc(query, func(r rune) bool {
+		return r == ' ' || r == '\t' || r == '\n' || r == '\r' ||
+			r == ',' || r == '，' || r == '。' || r == '?' || r == '？' ||
+			r == '!' || r == '！' || r == '、' || r == ';' || r == '；' ||
+			r == ':' || r == '：'
+	}) {
+		token = strings.TrimSpace(token)
+		if token == "" || isChineseStopQueryToken(token) {
+			continue
+		}
+		fields = append(fields, token)
+	}
+	return uniqueStrings(fields)
+}
+
+func isChineseStopQueryToken(token string) bool {
+	switch token {
+	case "搜索", "查找", "看看", "看下", "分析", "一下", "一下带来了", "出现了", "哪些", "什么", "相关", "信息":
+		return true
+	default:
+		return false
+	}
+}
+
+func containsCJK(value string) bool {
+	for _, r := range value {
+		if (r >= '\u4e00' && r <= '\u9fff') || (r >= '\u3400' && r <= '\u4dbf') {
+			return true
+		}
+	}
+	return false
+}
+
+func containsAnyFold(value string, needles ...string) bool {
+	lower := strings.ToLower(value)
+	for _, needle := range needles {
+		if strings.Contains(lower, strings.ToLower(needle)) {
+			return true
+		}
+	}
+	return false
 }
 
 func (r Researcher) rankAndDedupe(ctx context.Context, queries []string, results []SearchResult, mode Mode) []SearchResult {
@@ -998,6 +1115,7 @@ Research iteration: %d of %d
 <response_protocol>
 - NEVER output normal text. ONLY call tools.
 - Use targeted keyword queries, maximum 3 per search tool call.
+- Preserve the user's search language. If the user asks in Chinese, search with Chinese queries and Chinese/local source terms unless the user explicitly asks for English or global sources.
 - Default to web_search when information is missing or stale.
 - Call done when enough information has been gathered.
 - Do not invent tools.
@@ -1072,6 +1190,7 @@ func webSearchActionDescription(mode Mode) string {
 
 Your queries should be very targeted and specific to the information you need, avoid broad or generic queries.
 Your queries shouldn't be sentences but rather keywords that are SEO friendly and can be used to search the web for information.
+Preserve the user's language for search queries. If the user query is Chinese, write Chinese keyword queries and keep Chinese dates, place names, event words, and official-source terms in Chinese unless the user explicitly asks for English/global sources.
 
 You can search for 3 queries in one go, make sure to utilize all 3 queries to maximize the information you can gather. If a question is simple, then split your queries to cover different aspects or related topics to get a comprehensive understanding.`
 	switch mode {

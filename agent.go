@@ -648,7 +648,43 @@ func buildResearchQueries(query string, mode Mode, iterations int, now time.Time
 	query = expansion.Query
 	base := buildQueries(query, mode)
 	base = append(base, expansion.Variants...)
-	extras := []string{
+	extras := researchQueryExtras(query)
+	queries := uniqueStrings(append(base, extras...))
+	if len(queries) > iterations {
+		return queries[:iterations]
+	}
+	return queries
+}
+
+func researchQueryExtras(query string) []string {
+	if containsCJK(query) {
+		return []string{
+			query + " 关键信息",
+			query + " 最新进展",
+			query + " 专家解读",
+			query + " 不同说法",
+			query + " 一手来源",
+			query + " 数据",
+			query + " 时间线",
+			query + " 影响",
+			query + " 官方通报",
+			query + " 局限",
+			query + " 背景",
+			query + " 定义",
+			query + " 案例",
+			query + " 对比",
+			query + " 方法",
+			query + " 报告",
+			query + " 政策",
+			query + " 市场",
+			query + " 技术细节",
+			query + " 风险",
+			query + " 收益",
+			query + " 常见问题",
+			query + " 2026",
+		}
+	}
+	return []string{
 		query + " key facts",
 		query + " recent developments",
 		query + " expert analysis",
@@ -675,11 +711,6 @@ func buildResearchQueries(query string, mode Mode, iterations int, now time.Time
 		query + " FAQ",
 		query + " 2026",
 	}
-	queries := uniqueStrings(append(base, extras...))
-	if len(queries) > iterations {
-		return queries[:iterations]
-	}
-	return queries
 }
 
 type temporalQueryExpansion struct {
@@ -834,10 +865,6 @@ func eventImpactTerms(query string) []string {
 		"\u505c\u7535",
 		"\u505c\u8fd0",
 		"\u5b98\u65b9\u901a\u62a5",
-		"impact",
-		"damage",
-		"casualties",
-		"official report",
 	}
 }
 
