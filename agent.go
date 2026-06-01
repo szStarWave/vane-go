@@ -97,14 +97,14 @@ func (a SearchAgent) Run(ctx context.Context, req SearchAgentRequest) (SearchAge
 		Query:       req.Query,
 		ResultCount: len(sources),
 		SourceBlock: &SourceBlock{
-			Results: sources,
+			Results: limitResultsForContext(mode, sources),
 			Widgets: widgets,
 		},
-		Results: sources,
+		Results: limitResultsForContext(mode, sources),
 	})
 	return SearchAgentResult{
 		Classification: classification,
-		Sources:        sources,
+		Sources:        limitResultsForContext(mode, sources),
 		Widgets:        widgets,
 	}, err
 }

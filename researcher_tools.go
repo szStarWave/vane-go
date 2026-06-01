@@ -166,9 +166,6 @@ func (r Researcher) researchWithTools(ctx context.Context, req ResearchRequest) 
 				seen[key] = len(out)
 				out = append(out, result)
 			}
-			if len(out) > totalResultLimit(req.Mode) {
-				out = out[:totalResultLimit(req.Mode)]
-			}
 			resultEvent := &ToolResultEvent{
 				ID:          firstNonEmpty(call.ID, fmt.Sprintf("%s-%d", name, step+1)),
 				Name:        name,
@@ -213,12 +210,8 @@ func (r Researcher) researchWithTools(ctx context.Context, req ResearchRequest) 
 				done = true
 			}
 		}
-		if done || len(out) >= totalResultLimit(req.Mode) {
-			if done {
-				stopReason = "done"
-			} else {
-				stopReason = "result_limit"
-			}
+		if done {
+			stopReason = "done"
 			break
 		}
 		if shouldStopAfterSoftInformationBudget(req.Mode, out, informationCalls, firstPositive(req.SoftMaxInformationCalls, r.SoftMaxInformationCalls)) {
@@ -235,7 +228,7 @@ func (r Researcher) researchWithTools(ctx context.Context, req ResearchRequest) 
 		Mode:        req.Mode,
 		Query:       query,
 		ResultCount: len(out),
-		Results:     append([]SearchResult(nil), out...),
+		Results:     append([]SearchResult(nil), limitResultsForContext(req.Mode, out)...),
 		Metadata: map[string]any{
 			"stop_reason":       stopReason,
 			"information_calls": informationCalls,
@@ -244,6 +237,14 @@ func (r Researcher) researchWithTools(ctx context.Context, req ResearchRequest) 
 		},
 	})
 	return out, usedTools, firstErr
+}
+
+func limitResultsForContext(mode Mode, results []SearchResult) []SearchResult {
+	limit := totalResultLimit(mode)
+	if limit <= 0 || len(results) <= limit {
+		return results
+	}
+	return results[:limit]
 }
 
 func isInformationTool(name string) bool {

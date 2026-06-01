@@ -736,6 +736,52 @@ func TestResearcherDoesNotSoftStopOnGenericQualityResults(t *testing.T) {
 	}
 }
 
+func TestResearcherToolLoopDoesNotStopAtResultLimit(t *testing.T) {
+	searcher := &queryScopedManySearchProvider{}
+	researchModel := &scriptedResearchModel{calls: [][]model.ToolCall{
+		{toolCall("search-1", "web_search", map[string]any{"queries": []string{"first angle", "first detail", "first source"}})},
+		{toolCall("search-2", "web_search", map[string]any{"queries": []string{"second angle", "second detail", "second source"}})},
+		{toolCall("done-1", "done", map[string]any{})},
+	}}
+	var events []SearchEvent
+	researcher := Researcher{
+		ResearchModel:  researchModel,
+		SearchProvider: searcher,
+		OnSearchEvent: func(_ context.Context, ev SearchEvent) {
+			events = append(events, ev)
+		},
+	}
+	results, err := researcher.Research(context.Background(), ResearchRequest{
+		Query: "wide research",
+		Classification: Classification{
+			ShouldSearch:       true,
+			StandaloneFollowUp: "wide research",
+			Sources:            []SearchSource{SearchSourceWeb},
+		},
+		Mode:    ModeQuality,
+		Sources: []SearchSource{SearchSourceWeb},
+	})
+	if err != nil {
+		t.Fatalf("Research: %v", err)
+	}
+	if len(researchModel.requests) != 3 {
+		t.Fatalf("research model requests = %d, want second search plus done after reaching source limit", len(researchModel.requests))
+	}
+	if len(results) <= totalResultLimit(ModeQuality) {
+		t.Fatalf("results = %d, want researcher to keep gathering beyond final context limit", len(results))
+	}
+	end := lastSearchEventOfType(events, SearchEventEnd)
+	if end == nil {
+		t.Fatalf("missing end event: %#v", events)
+	}
+	if got, _ := end.Metadata["stop_reason"].(string); got != "done" {
+		t.Fatalf("stop_reason = %q, want done; metadata=%#v", got, end.Metadata)
+	}
+	if len(end.Results) != totalResultLimit(ModeQuality) {
+		t.Fatalf("end results = %d, want final event clipped to context limit %d", len(end.Results), totalResultLimit(ModeQuality))
+	}
+}
+
 type staticTextModel struct {
 	text string
 }
@@ -765,6 +811,26 @@ func (p *manySearchProvider) Search(_ context.Context, query string, opts Search
 		results = append(results, SearchResult{
 			Title:   fmt.Sprintf("Result %d", i+1),
 			URL:     fmt.Sprintf("https://example.com/result-%d", i+1),
+			Content: fmt.Sprintf("Search snippet %d for %s", i+1, query),
+			Source:  opts.Source,
+		})
+	}
+	return results, nil
+}
+
+type queryScopedManySearchProvider struct{}
+
+func (p *queryScopedManySearchProvider) Search(_ context.Context, query string, opts SearchOptions) ([]SearchResult, error) {
+	limit := opts.Limit
+	if limit <= 0 {
+		limit = 10
+	}
+	results := make([]SearchResult, 0, limit)
+	prefix := strings.NewReplacer(" ", "-", "/", "-", "?", "").Replace(strings.ToLower(query))
+	for i := 0; i < limit; i++ {
+		results = append(results, SearchResult{
+			Title:   fmt.Sprintf("%s result %d", query, i+1),
+			URL:     fmt.Sprintf("https://example.com/%s/result-%d", prefix, i+1),
 			Content: fmt.Sprintf("Search snippet %d for %s", i+1, query),
 			Source:  opts.Source,
 		})
@@ -837,6 +903,15 @@ func hasSearchEventPhase(events []SearchEvent, phase string) bool {
 		}
 	}
 	return false
+}
+
+func lastSearchEventOfType(events []SearchEvent, typ SearchEventType) *SearchEvent {
+	for i := len(events) - 1; i >= 0; i-- {
+		if events[i].Type == typ {
+			return &events[i]
+		}
+	}
+	return nil
 }
 
 func (m *staticTextModel) Info() model.Info { return model.Info{Name: "static"} }
