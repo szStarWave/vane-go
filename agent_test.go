@@ -390,6 +390,34 @@ func TestResearcherPassesExtraFields(t *testing.T) {
 	}
 }
 
+func TestAnsweringModelMergesDefaultExtraFields(t *testing.T) {
+	base := &captureModel{}
+	wrapped := &AnsweringModel{
+		Base:        base,
+		ExtraFields: map[string]any{"cache_prompt": true, "keep": "default"},
+	}
+	ch, err := wrapped.GenerateContent(context.Background(), &model.Request{
+		Messages: []model.Message{model.NewUserMessage("hello")},
+		ExtraFields: map[string]any{
+			"keep":        "request",
+			"temperature": 0,
+		},
+	})
+	if err != nil {
+		t.Fatalf("GenerateContent: %v", err)
+	}
+	for range ch {
+	}
+	if base.req == nil {
+		t.Fatal("base model was not called")
+	}
+	if base.req.ExtraFields["cache_prompt"] != true ||
+		base.req.ExtraFields["keep"] != "request" ||
+		base.req.ExtraFields["temperature"] != 0 {
+		t.Fatalf("extra fields = %#v, want merged defaults with request override", base.req.ExtraFields)
+	}
+}
+
 func TestQualityResearchScrapesAndExtractsFacts(t *testing.T) {
 	searcher := &recordingSearchProvider{}
 	researchModel := &scriptedResearchModel{calls: [][]model.ToolCall{

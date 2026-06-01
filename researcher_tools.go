@@ -87,7 +87,7 @@ func (r Researcher) researchWithTools(ctx context.Context, req ResearchRequest) 
 				MaxTokens:   intPtr(900),
 			},
 			Tools:       tools,
-			ExtraFields: firstMap(req.ExtraFields, r.ExtraFields),
+			ExtraFields: mergeExtraFields(r.ExtraFields, req.ExtraFields),
 		})
 		if err != nil {
 			if firstErr == nil {

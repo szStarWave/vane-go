@@ -34,7 +34,7 @@ func (m *AnsweringModel) GenerateContent(ctx context.Context, request *model.Req
 		ModelInfo:               m.ModelInfo,
 		Messages:                request.Messages,
 		GenerationConfig:        request.GenerationConfig,
-		ExtraFields:             request.ExtraFields,
+		ExtraFields:             mergeExtraFields(m.ExtraFields, request.ExtraFields),
 		Mode:                    mode,
 		SystemInstructions:      m.SystemInstructions,
 		SearchProvider:          m.SearchProvider,

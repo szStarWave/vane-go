@@ -92,3 +92,19 @@ func firstMap(values ...map[string]any) map[string]any {
 	}
 	return nil
 }
+
+func mergeExtraFields(values ...map[string]any) map[string]any {
+	var out map[string]any
+	for _, value := range values {
+		if len(value) == 0 {
+			continue
+		}
+		if out == nil {
+			out = map[string]any{}
+		}
+		for key, item := range value {
+			out[key] = item
+		}
+	}
+	return out
+}

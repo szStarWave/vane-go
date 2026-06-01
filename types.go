@@ -124,6 +124,7 @@ type AnsweringModel struct {
 	Base                    model.Model
 	ResearchModel           model.Model
 	ModelInfo               ModelInfo
+	ExtraFields             map[string]any
 	Mode                    Mode
 	SearchProvider          SearchProvider
 	ScrapeProvider          ScrapeProvider
