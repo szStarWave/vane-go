@@ -15,6 +15,7 @@ import (
 type SearchAgent struct {
 	ClassifierModel         model.Model
 	ResearchModel           model.Model
+	ExtraFields             map[string]any
 	SearchProvider          SearchProvider
 	ScrapeProvider          ScrapeProvider
 	EmbeddingProvider       EmbeddingProvider
@@ -28,6 +29,7 @@ type SearchAgent struct {
 type SearchAgentRequest struct {
 	Query                   string
 	Messages                []model.Message
+	ExtraFields             map[string]any
 	Mode                    Mode
 	Sources                 []SearchSource
 	FileIDs                 []string
@@ -71,6 +73,7 @@ func (a SearchAgent) Run(ctx context.Context, req SearchAgentRequest) (SearchAge
 	}
 	researcher := Researcher{
 		ResearchModel:           firstModel(a.ResearchModel, a.ClassifierModel),
+		ExtraFields:             a.ExtraFields,
 		SearchProvider:          a.SearchProvider,
 		ScrapeProvider:          a.ScrapeProvider,
 		EmbeddingProvider:       a.EmbeddingProvider,
@@ -82,6 +85,7 @@ func (a SearchAgent) Run(ctx context.Context, req SearchAgentRequest) (SearchAge
 	sources, err := researcher.Research(ctx, ResearchRequest{
 		Query:                   req.Query,
 		Messages:                req.Messages,
+		ExtraFields:             req.ExtraFields,
 		Classification:          classification,
 		Mode:                    mode,
 		Sources:                 classification.Sources,
@@ -460,6 +464,7 @@ func (a SearchAgent) runWidgets(ctx context.Context, query string, classificatio
 
 type Researcher struct {
 	ResearchModel           model.Model
+	ExtraFields             map[string]any
 	SearchProvider          SearchProvider
 	ScrapeProvider          ScrapeProvider
 	EmbeddingProvider       EmbeddingProvider
@@ -472,6 +477,7 @@ type Researcher struct {
 type ResearchRequest struct {
 	Query                   string
 	Messages                []model.Message
+	ExtraFields             map[string]any
 	Classification          Classification
 	Mode                    Mode
 	Sources                 []SearchSource

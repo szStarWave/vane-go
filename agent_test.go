@@ -291,6 +291,105 @@ func TestResearcherUsesNativeToolCallLoop(t *testing.T) {
 	}
 }
 
+func TestResearcherPromptStableAcrossIterations(t *testing.T) {
+	searcher := &recordingSearchProvider{}
+	researchModel := &scriptedResearchModel{calls: [][]model.ToolCall{
+		{toolCall("search-1", "web_search", map[string]any{"queries": []string{"vane search agent"}})},
+		{toolCall("done-1", "done", map[string]any{})},
+	}}
+	researcher := Researcher{ResearchModel: researchModel, SearchProvider: searcher}
+	_, err := researcher.Research(context.Background(), ResearchRequest{
+		Query: "what is vane",
+		Classification: Classification{
+			ShouldSearch:       true,
+			StandaloneFollowUp: "what is vane",
+			Sources:            []SearchSource{SearchSourceWeb},
+		},
+		Mode:    ModeBalanced,
+		Sources: []SearchSource{SearchSourceWeb},
+	})
+	if err != nil {
+		t.Fatalf("Research: %v", err)
+	}
+	if len(researchModel.requests) < 2 {
+		t.Fatalf("research requests = %d, want at least two", len(researchModel.requests))
+	}
+	firstPrompt := researchModel.requests[0].Messages[0].Content
+	secondPrompt := researchModel.requests[1].Messages[0].Content
+	if firstPrompt != secondPrompt {
+		t.Fatalf("researcher system prompt changed across iterations")
+	}
+	if strings.Contains(firstPrompt, "Research iteration:") {
+		t.Fatalf("researcher system prompt contains dynamic iteration text: %s", firstPrompt)
+	}
+	if !requestContainsContent(researchModel.requests[1], "<research_status iteration=\"2\"") {
+		t.Fatalf("second request missing dynamic research status: %#v", researchModel.requests[1].Messages)
+	}
+}
+
+func TestResearcherCompactsToolHistoryButKeepsFullResults(t *testing.T) {
+	searcher := &recordingSearchProvider{content: strings.Repeat("full source content ", 80)}
+	researchModel := &scriptedResearchModel{calls: [][]model.ToolCall{
+		{toolCall("search-1", "web_search", map[string]any{"queries": []string{"vane search agent"}})},
+		{toolCall("done-1", "done", map[string]any{})},
+	}}
+	researcher := Researcher{ResearchModel: researchModel, SearchProvider: searcher}
+	results, err := researcher.Research(context.Background(), ResearchRequest{
+		Query: "what is vane",
+		Classification: Classification{
+			ShouldSearch:       true,
+			StandaloneFollowUp: "what is vane",
+			Sources:            []SearchSource{SearchSourceWeb},
+		},
+		Mode:    ModeBalanced,
+		Sources: []SearchSource{SearchSourceWeb},
+	})
+	if err != nil {
+		t.Fatalf("Research: %v", err)
+	}
+	if len(results) == 0 || len([]rune(results[0].Content)) <= historySnippetRunes {
+		t.Fatalf("results lost full content: %#v", results)
+	}
+	if len(researchModel.requests) < 2 {
+		t.Fatalf("research requests = %d, want at least two", len(researchModel.requests))
+	}
+	toolContent := lastToolMessageContent(researchModel.requests[1])
+	if toolContent == "" {
+		t.Fatalf("second request missing compacted tool message: %#v", researchModel.requests[1].Messages)
+	}
+	if strings.Contains(toolContent, strings.Repeat("full source content ", 40)) {
+		t.Fatalf("tool history was not compacted: %d chars", len(toolContent))
+	}
+	if !strings.Contains(toolContent, "content") || !strings.Contains(toolContent, "...") {
+		t.Fatalf("tool history missing compacted snippet: %s", toolContent)
+	}
+}
+
+func TestResearcherPassesExtraFields(t *testing.T) {
+	searcher := &recordingSearchProvider{}
+	researchModel := &scriptedResearchModel{calls: [][]model.ToolCall{
+		{toolCall("done-1", "done", map[string]any{})},
+	}}
+	researcher := Researcher{ResearchModel: researchModel, SearchProvider: searcher}
+	_, err := researcher.Research(context.Background(), ResearchRequest{
+		Query:       "what is vane",
+		ExtraFields: map[string]any{"cache_prompt": true},
+		Classification: Classification{
+			ShouldSearch:       true,
+			StandaloneFollowUp: "what is vane",
+			Sources:            []SearchSource{SearchSourceWeb},
+		},
+		Mode:    ModeBalanced,
+		Sources: []SearchSource{SearchSourceWeb},
+	})
+	if err != nil {
+		t.Fatalf("Research: %v", err)
+	}
+	if len(researchModel.requests) == 0 || researchModel.requests[0].ExtraFields["cache_prompt"] != true {
+		t.Fatalf("research request extra fields = %#v, want cache_prompt", researchModel.requests)
+	}
+}
+
 func TestQualityResearchScrapesAndExtractsFacts(t *testing.T) {
 	searcher := &recordingSearchProvider{}
 	researchModel := &scriptedResearchModel{calls: [][]model.ToolCall{
@@ -625,7 +724,7 @@ func TestQualityResearcherPromptRequiresMultiRoundSearch(t *testing.T) {
 		},
 		Mode:    ModeQuality,
 		Sources: []SearchSource{SearchSourceWeb},
-	}, 0, defaultMaxIterations(ModeQuality))
+	})
 	if !strings.Contains(prompt, "aim for 3-5 information-gathering calls") ||
 		!strings.Contains(prompt, "You MUST call __reasoning_preamble before every tool call") ||
 		!strings.Contains(prompt, "Start broad, then narrow") {
@@ -643,7 +742,7 @@ func TestBalancedResearcherPromptRequiresReasoningPreamble(t *testing.T) {
 		},
 		Mode:    ModeBalanced,
 		Sources: []SearchSource{SearchSourceWeb},
-	}, 0, defaultMaxIterations(ModeBalanced))
+	})
 	if !strings.Contains(prompt, "You MUST call __reasoning_preamble before every tool call") ||
 		!strings.Contains(prompt, "Use at most 6 tool calls total") {
 		t.Fatalf("balanced researcher prompt missing original-style tool guidance: %s", prompt)
@@ -890,6 +989,7 @@ type staticTextModel struct {
 
 type recordingSearchProvider struct {
 	queries []string
+	content string
 }
 
 func (p *recordingSearchProvider) Search(_ context.Context, query string, _ SearchOptions) ([]SearchResult, error) {
@@ -897,7 +997,7 @@ func (p *recordingSearchProvider) Search(_ context.Context, query string, _ Sear
 	return []SearchResult{{
 		Title:   "\u54c8\u5c14\u6ee8\u5f3a\u5bf9\u6d41\u5929\u6c14",
 		URL:     "https://example.com/harbin-tornado",
-		Content: "2026\u5e745\u670831\u65e5\u54c8\u5c14\u6ee8\u51fa\u73b0\u5927\u98ce\u548c\u9f99\u5377\u98ce\u76f8\u5173\u62a5\u9053\u3002",
+		Content: firstNonEmpty(p.content, "2026\u5e745\u670831\u65e5\u54c8\u5c14\u6ee8\u51fa\u73b0\u5927\u98ce\u548c\u9f99\u5377\u98ce\u76f8\u5173\u62a5\u9053\u3002"),
 	}}, nil
 }
 
@@ -1018,6 +1118,30 @@ func countResearchRequestsContaining(requests []*model.Request, needle string) i
 		}
 	}
 	return count
+}
+
+func requestContainsContent(req *model.Request, needle string) bool {
+	if req == nil {
+		return false
+	}
+	for _, msg := range req.Messages {
+		if strings.Contains(msg.Content, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+func lastToolMessageContent(req *model.Request) string {
+	if req == nil {
+		return ""
+	}
+	for i := len(req.Messages) - 1; i >= 0; i-- {
+		if req.Messages[i].Role == model.RoleTool {
+			return req.Messages[i].Content
+		}
+	}
+	return ""
 }
 
 func longArticleContent() string {

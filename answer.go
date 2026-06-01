@@ -42,6 +42,7 @@ func Answer(ctx context.Context, req Request) (<-chan *model.Response, error) {
 	agent := SearchAgent{
 		ClassifierModel:         req.Model,
 		ResearchModel:           firstModel(req.ResearchModel, req.Model),
+		ExtraFields:             req.ExtraFields,
 		SearchProvider:          provider,
 		ScrapeProvider:          req.ScrapeProvider,
 		EmbeddingProvider:       req.EmbeddingProvider,
@@ -54,6 +55,7 @@ func Answer(ctx context.Context, req Request) (<-chan *model.Response, error) {
 	result, err := agent.Run(ctx, SearchAgentRequest{
 		Query:                   query,
 		Messages:                req.Messages,
+		ExtraFields:             req.ExtraFields,
 		Mode:                    mode,
 		Sources:                 req.Sources,
 		FileIDs:                 req.FileIDs,

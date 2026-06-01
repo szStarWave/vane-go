@@ -36,11 +36,13 @@ type scrapeURLArgs struct {
 }
 
 const (
-	extractFactsMinRunes  = 1200
-	extractFactsChunkSize = 6000
-	extractFactsOverlap   = 300
-	extractFactsMaxChunks = 3
-	extractFactsMaxTokens = 600
+	extractFactsMinRunes   = 1200
+	extractFactsChunkSize  = 6000
+	extractFactsOverlap    = 300
+	extractFactsMaxChunks  = 3
+	extractFactsMaxTokens  = 600
+	historySnippetRunes    = 500
+	historyMaxQualityItems = 6
 )
 
 func (r Researcher) researchWithTools(ctx context.Context, req ResearchRequest) ([]SearchResult, bool, error) {
@@ -76,15 +78,16 @@ func (r Researcher) researchWithTools(ctx context.Context, req ResearchRequest) 
 	informationCalls := 0
 	stopReason := "max_iterations"
 	for step := 0; step < iterations; step++ {
-		prompt := getResearcherPrompt(req, step, iterations)
+		prompt := getResearcherPrompt(req)
 		ch, err := r.ResearchModel.GenerateContent(ctx, &model.Request{
-			Messages: append([]model.Message{model.NewSystemMessage(prompt)}, history...),
+			Messages: buildResearcherMessages(prompt, history, step, iterations, len(out), informationCalls),
 			GenerationConfig: model.GenerationConfig{
 				Stream:      true,
 				Temperature: floatPtr(0),
 				MaxTokens:   intPtr(900),
 			},
-			Tools: tools,
+			Tools:       tools,
+			ExtraFields: firstMap(req.ExtraFields, r.ExtraFields),
 		})
 		if err != nil {
 			if firstErr == nil {
@@ -212,7 +215,7 @@ func (r Researcher) researchWithTools(ctx context.Context, req ResearchRequest) 
 					Results:     append([]SearchResult(nil), out[before:]...),
 				})
 			}
-			payload, _ := json.Marshal(actionResult)
+			payload, _ := json.Marshal(compactActionResultForHistory(req.Mode, actionResult))
 			history = append(history, model.NewToolMessage(firstNonEmpty(call.ID, fmt.Sprintf("%s-%d", name, step+1)), name, string(payload)))
 			if actionResult.Done || name == "done" {
 				done = true
@@ -253,6 +256,62 @@ func limitResultsForContext(mode Mode, results []SearchResult) []SearchResult {
 		return results
 	}
 	return results[:limit]
+}
+
+func buildResearcherMessages(prompt string, history []model.Message, step int, iterations int, sourceCount int, informationCalls int) []model.Message {
+	messages := make([]model.Message, 0, len(history)+2)
+	messages = append(messages, model.NewSystemMessage(prompt))
+	messages = append(messages, history...)
+	messages = append(messages, model.NewUserMessage(fmt.Sprintf(
+		"<research_status iteration=\"%d\" max_iterations=\"%d\" gathered_sources=\"%d\" information_calls=\"%d\" />",
+		step+1, iterations, sourceCount, informationCalls,
+	)))
+	return messages
+}
+
+func compactActionResultForHistory(mode Mode, result researchActionResult) researchActionResult {
+	if len(result.Results) == 0 {
+		return result
+	}
+	limit := historyResultLimit(mode)
+	if limit > len(result.Results) {
+		limit = len(result.Results)
+	}
+	out := researchActionResult{
+		Type:      result.Type,
+		Reasoning: result.Reasoning,
+		Done:      result.Done,
+		Error:     result.Error,
+		Results:   make([]SearchResult, 0, limit),
+	}
+	for _, item := range result.Results[:limit] {
+		item.Content = truncateRunes(strings.TrimSpace(item.Content), historySnippetRunes)
+		out.Results = append(out.Results, item)
+	}
+	if len(result.Results) > limit {
+		if out.Error == "" {
+			out.Error = fmt.Sprintf("history compacted: %d of %d results shown", limit, len(result.Results))
+		}
+	}
+	return out
+}
+
+func historyResultLimit(mode Mode) int {
+	if mode == ModeQuality {
+		return historyMaxQualityItems
+	}
+	return 3
+}
+
+func truncateRunes(value string, limit int) string {
+	if limit <= 0 {
+		return ""
+	}
+	runes := []rune(value)
+	if len(runes) <= limit {
+		return value
+	}
+	return string(runes[:limit]) + "..."
 }
 
 func isInformationTool(name string) bool {
@@ -1120,7 +1179,7 @@ func (r Researcher) scrapeURLs(ctx context.Context, req ResearchRequest, urls []
 	return researchActionResult{Type: "search_results", Results: compactResults(results)}, nil
 }
 
-func getResearcherPrompt(req ResearchRequest, i, maxIteration int) string {
+func getResearcherPrompt(req ResearchRequest) string {
 	today := time.Now().Format("January 2, 2006")
 	if !req.Now.IsZero() {
 		today = req.Now.Format("January 2, 2006")
@@ -1129,7 +1188,6 @@ func getResearcherPrompt(req ResearchRequest, i, maxIteration int) string {
 	base := fmt.Sprintf(`Assistant is Vane's action orchestrator. Fulfill the user's request by selecting available tools only; do not write the final answer directly.
 
 Today's date: %s
-Research iteration: %d of %d
 
 <available_tools>
 %s
@@ -1142,7 +1200,7 @@ Research iteration: %d of %d
 - Default to web_search when information is missing or stale.
 - Call done when enough information has been gathered.
 - Do not invent tools.
-</response_protocol>`, today, i+1, maxIteration, actionDesc)
+</response_protocol>`, today, actionDesc)
 	switch req.Mode {
 	case ModeSpeed:
 		return base + `
