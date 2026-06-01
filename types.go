@@ -60,6 +60,7 @@ type SearchResult struct {
 	URL     string       `json:"url"`
 	Content string       `json:"content"`
 	Source  SearchSource `json:"source,omitempty"`
+	Stage   string       `json:"stage,omitempty"`
 }
 
 type ModelInfo struct {

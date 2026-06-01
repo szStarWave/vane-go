@@ -410,11 +410,13 @@ func (r Researcher) deepReadQuality(ctx context.Context, req ResearchRequest, qu
 			pickedKeys[key] = true
 		}
 		if strings.TrimSpace(result.URL) == "" {
+			result.Stage = "deep_read"
 			out = append(out, result)
 			continue
 		}
 		doc, err := r.ScrapeProvider.Scrape(ctx, result.URL)
 		if err != nil || strings.TrimSpace(doc.Content) == "" {
+			result.Stage = "deep_read"
 			out = append(out, result)
 			continue
 		}
@@ -427,18 +429,25 @@ func (r Researcher) deepReadQuality(ctx context.Context, req ResearchRequest, qu
 			URL:     firstNonEmpty(doc.URL, result.URL),
 			Content: facts,
 			Source:  result.Source,
+			Stage:   "deep_read",
 		})
 	}
 	if len(out) == 0 {
 		return results
 	}
-	out = append(out, supplementalQualityResults(results, pickedKeys, totalResultLimit(req.Mode)-len(out))...)
+	supplementalLimit := min(maxQualitySupplementalResults, totalResultLimit(req.Mode)-len(out))
+	out = append(out, supplementalQualityResults(queries, results, pickedKeys, supplementalLimit)...)
 	return dedupeResults(out)
 }
 
-func supplementalQualityResults(results []SearchResult, exclude map[string]bool, limit int) []SearchResult {
+const maxQualitySupplementalResults = 8
+
+func supplementalQualityResults(queries []string, results []SearchResult, exclude map[string]bool, limit int) []SearchResult {
 	if limit <= 0 {
 		return nil
+	}
+	if limit > maxQualitySupplementalResults {
+		limit = maxQualitySupplementalResults
 	}
 	var out []SearchResult
 	for _, result := range results {
@@ -446,12 +455,65 @@ func supplementalQualityResults(results []SearchResult, exclude map[string]bool,
 		if key == "" || exclude[key] {
 			continue
 		}
+		if !qualitySupplementalRelevant(queries, result) {
+			continue
+		}
+		result.Stage = "supplemental"
 		out = append(out, result)
 		if len(out) >= limit {
 			break
 		}
 	}
 	return out
+}
+
+func qualitySupplementalRelevant(queries []string, result SearchResult) bool {
+	terms := queryRelevanceTerms(queries)
+	if len(terms) == 0 {
+		return true
+	}
+	haystack := strings.ToLower(result.Title + "\n" + result.Content + "\n" + result.URL)
+	matches := 0
+	for _, term := range terms {
+		if strings.Contains(haystack, term) {
+			matches++
+		}
+	}
+	if len(terms) <= 2 {
+		return matches > 0
+	}
+	return matches >= 2
+}
+
+func queryRelevanceTerms(queries []string) []string {
+	stop := map[string]bool{
+		"the": true, "and": true, "for": true, "with": true, "from": true, "into": true,
+		"latest": true, "overview": true, "official": true, "report": true, "reports": true,
+		"impact": true, "impacts": true, "timeline": true, "statistics": true,
+		"搜索": true, "看看": true, "哪些": true, "分析": true, "影响": true, "事故": true,
+		"重大": true, "昨日": true, "昨天": true, "官方": true, "通报": true,
+	}
+	seen := map[string]bool{}
+	var terms []string
+	for _, query := range queries {
+		for _, raw := range strings.FieldsFunc(strings.ToLower(query), func(r rune) bool {
+			return !(r >= 'a' && r <= 'z') && !(r >= '0' && r <= '9') && !(r >= '\u4e00' && r <= '\u9fff')
+		}) {
+			term := strings.TrimSpace(raw)
+			if term == "" || stop[term] || seen[term] {
+				continue
+			}
+			if len([]rune(term)) < 2 {
+				continue
+			}
+			seen[term] = true
+			terms = append(terms, term)
+			if len(terms) >= 12 {
+				return terms
+			}
+		}
+	}
+	return terms
 }
 
 func (r Researcher) pickQualityResults(ctx context.Context, queries []string, results []SearchResult) []SearchResult {

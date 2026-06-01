@@ -350,6 +350,38 @@ func TestQualityResearchKeepsSupplementalSearchSources(t *testing.T) {
 	}
 }
 
+func TestQualitySupplementalSourcesAreFilteredAndCapped(t *testing.T) {
+	results := []SearchResult{
+		{Title: "Picked", URL: "https://example.com/picked", Content: "Harbin tornado picked"},
+	}
+	exclude := map[string]bool{"https://example.com/picked": true}
+	for i := 0; i < 20; i++ {
+		title := fmt.Sprintf("Irrelevant %d", i)
+		content := "unrelated entertainment result"
+		if i%2 == 0 {
+			title = fmt.Sprintf("Harbin tornado local report %d", i)
+			content = "Harbin tornado damage and outage details"
+		}
+		results = append(results, SearchResult{
+			Title:   title,
+			URL:     fmt.Sprintf("https://example.com/%d", i),
+			Content: content,
+		})
+	}
+	got := supplementalQualityResults([]string{"Harbin tornado damage"}, results, exclude, 20)
+	if len(got) != maxQualitySupplementalResults {
+		t.Fatalf("supplemental len = %d, want cap %d: %#v", len(got), maxQualitySupplementalResults, got)
+	}
+	for _, result := range got {
+		if result.Stage != "supplemental" {
+			t.Fatalf("supplemental stage = %q, want supplemental", result.Stage)
+		}
+		if !strings.Contains(strings.ToLower(result.Title+result.Content), "harbin") {
+			t.Fatalf("irrelevant supplemental result kept: %#v", result)
+		}
+	}
+}
+
 func TestQualityResearcherPromptRequiresMultiRoundSearch(t *testing.T) {
 	prompt := getResearcherPrompt(ResearchRequest{
 		Query: "Harbin tornado impacts",
