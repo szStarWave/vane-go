@@ -292,11 +292,14 @@ func TestQualityResearchScrapesAndExtractsFacts(t *testing.T) {
 		{toolCall("search-1", "web_search", map[string]any{"queries": []string{"Harbin tornado official report"}})},
 		{toolCall("done-1", "done", map[string]any{})},
 	}}
+	var events []SearchEvent
 	researcher := Researcher{
 		ResearchModel:  researchModel,
 		SearchProvider: searcher,
 		ScrapeProvider: staticScrapeProvider{content: "Long article: tornado caused power outage and traffic disruption."},
-		OnSearchEvent:  func(context.Context, SearchEvent) {},
+		OnSearchEvent: func(_ context.Context, ev SearchEvent) {
+			events = append(events, ev)
+		},
 	}
 	results, err := researcher.Research(context.Background(), ResearchRequest{
 		Query: "Harbin tornado impacts",
@@ -313,6 +316,11 @@ func TestQualityResearchScrapesAndExtractsFacts(t *testing.T) {
 	}
 	if len(results) == 0 || !strings.Contains(results[0].Content, "Extracted tornado fact") {
 		t.Fatalf("quality results = %#v, want extracted facts", results)
+	}
+	for _, phase := range []string{"picking_sources", "deep_read", "extract_facts"} {
+		if !hasSearchEventPhase(events, phase) {
+			t.Fatalf("events missing phase %q: %#v", phase, events)
+		}
 	}
 }
 
@@ -817,6 +825,18 @@ func (p *blockingSearchProvider) activeCount() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.active
+}
+
+func hasSearchEventPhase(events []SearchEvent, phase string) bool {
+	for _, ev := range events {
+		if ev.Type != SearchEventResearchStep || ev.Metadata == nil {
+			continue
+		}
+		if got, _ := ev.Metadata["phase"].(string); got == phase {
+			return true
+		}
+	}
+	return false
 }
 
 func (m *staticTextModel) Info() model.Info { return model.Info{Name: "static"} }

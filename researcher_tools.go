@@ -590,6 +590,17 @@ func (r Researcher) deepReadQuality(ctx context.Context, req ResearchRequest, qu
 	if len(candidates) == 0 {
 		candidates = results
 	}
+	emitSearchEvent(ctx, r.OnSearchEvent, SearchEvent{
+		Type:    SearchEventResearchStep,
+		Mode:    req.Mode,
+		Query:   req.Query,
+		Step:    0,
+		Message: "正在筛选最值得深读的来源",
+		Metadata: map[string]any{
+			"phase":           "picking_sources",
+			"candidate_count": len(candidates),
+		},
+	})
 	picked := r.pickQualityResults(ctx, queries, candidates)
 	if len(picked) == 0 {
 		picked = candidates
@@ -617,7 +628,7 @@ func (r Researcher) deepReadQuality(ctx context.Context, req ResearchRequest, qu
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			outcomes[i] = r.deepReadOne(ctx, queries, result)
+			outcomes[i] = r.deepReadOne(ctx, req, queries, result, i+1, len(picked))
 		}()
 	}
 	wg.Wait()
@@ -639,17 +650,31 @@ func (r Researcher) deepReadQuality(ctx context.Context, req ResearchRequest, qu
 	return dedupeResults(out)
 }
 
-func (r Researcher) deepReadOne(ctx context.Context, queries []string, result SearchResult) SearchResult {
+func (r Researcher) deepReadOne(ctx context.Context, req ResearchRequest, queries []string, result SearchResult, index int, total int) SearchResult {
 	if strings.TrimSpace(result.URL) == "" {
 		result.Stage = "deep_read"
 		return result
 	}
+	emitSearchEvent(ctx, r.OnSearchEvent, SearchEvent{
+		Type:    SearchEventResearchStep,
+		Mode:    req.Mode,
+		Query:   req.Query,
+		Step:    index,
+		Message: firstNonEmpty(result.Title, result.URL),
+		Metadata: map[string]any{
+			"phase": "deep_read",
+			"index": index,
+			"total": total,
+			"url":   result.URL,
+			"title": result.Title,
+		},
+	})
 	doc, err := r.ScrapeProvider.Scrape(ctx, result.URL)
 	if err != nil || strings.TrimSpace(doc.Content) == "" {
 		result.Stage = "deep_read"
 		return result
 	}
-	facts := r.extractFacts(ctx, queries, doc.Content)
+	facts := r.extractFacts(ctx, req, queries, doc.Content, firstNonEmpty(doc.Title, result.Title, result.URL))
 	if strings.TrimSpace(facts) == "" {
 		facts = doc.Content
 	}
@@ -863,7 +888,7 @@ func (r Researcher) pickQualityResults(ctx context.Context, queries []string, re
 	return picked
 }
 
-func (r Researcher) extractFacts(ctx context.Context, queries []string, content string) string {
+func (r Researcher) extractFacts(ctx context.Context, req ResearchRequest, queries []string, content string, title string) string {
 	if r.ResearchModel == nil {
 		return content
 	}
@@ -878,6 +903,19 @@ func (r Researcher) extractFacts(ctx context.Context, queries []string, content 
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
+			emitSearchEvent(ctx, r.OnSearchEvent, SearchEvent{
+				Type:    SearchEventResearchStep,
+				Mode:    req.Mode,
+				Query:   req.Query,
+				Step:    i + 1,
+				Message: title,
+				Metadata: map[string]any{
+					"phase": "extract_facts",
+					"index": i + 1,
+					"total": len(chunks),
+					"title": title,
+				},
+			})
 			ch, err := r.ResearchModel.GenerateContent(ctx, &model.Request{
 				Messages: []model.Message{
 					model.NewSystemMessage("You are Vane's information extractor. Return compact JSON only: {\"extracted_facts\":\"- Fact\"}. Extract only facts relevant to the queries, preserve raw numbers and table values, remove boilerplate."),
@@ -930,7 +968,7 @@ func (r Researcher) scrapeURLs(ctx context.Context, req ResearchRequest, urls []
 			}
 			content := doc.Content
 			if req.Mode == ModeQuality {
-				if facts := r.extractFacts(ctx, []string{req.Query}, doc.Content); facts != "" {
+				if facts := r.extractFacts(ctx, req, []string{req.Query}, doc.Content, firstNonEmpty(doc.Title, rawURL)); facts != "" {
 					content = facts
 				}
 			}
