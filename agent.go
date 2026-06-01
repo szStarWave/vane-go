@@ -181,7 +181,8 @@ Rules:
 - Set discussionSearch=true for community feedback, real user experience, bugs, issues, complaints, Reddit/HN/forum/GitHub issue style questions.
 - Set personalSearch=true only when uploaded files/personal documents are relevant.
 - Set widget flags when weather, stock, or calculation widgets can help.
-- standaloneFollowUp must be self-contained and context-independent.`
+- standaloneFollowUp must be self-contained and context-independent.
+- Preserve the latest user query language in standaloneFollowUp. If the latest user query is Chinese, standaloneFollowUp MUST be Chinese unless the user explicitly asks for English/global sources.`
 }
 
 func classifierUserPrompt(req SearchAgentRequest) string {
@@ -278,8 +279,8 @@ func parseClassifierJSON(text string, req SearchAgentRequest, fallback Classific
 	if parsed.NeedCalc != nil {
 		out.NeedCalc = *parsed.NeedCalc
 	}
-	if strings.TrimSpace(parsed.StandaloneFollowUp) != "" {
-		out.StandaloneFollowUp = strings.TrimSpace(parsed.StandaloneFollowUp)
+	if standalone := normalizeClassifierStandaloneFollowUp(req, parsed.StandaloneFollowUp, fallback.StandaloneFollowUp); standalone != "" {
+		out.StandaloneFollowUp = standalone
 	}
 	if out.ShouldSearch {
 		modelSources := append([]SearchSource{}, parsed.Sources...)
@@ -299,6 +300,21 @@ func parseClassifierJSON(text string, req SearchAgentRequest, fallback Classific
 		out.Sources = append(out.Sources, SearchSourceUploads)
 	}
 	return out, nil
+}
+
+func normalizeClassifierStandaloneFollowUp(req SearchAgentRequest, candidate string, fallback string) string {
+	candidate = strings.TrimSpace(candidate)
+	fallback = strings.TrimSpace(fallback)
+	if candidate == "" {
+		return fallback
+	}
+	if prefersChineseQueryText(req.Query) && !queryLanguageExplicitlyAllowsEnglish(req.Query) && !containsCJK(candidate) {
+		if fallback != "" {
+			return fallback
+		}
+		return strings.TrimSpace(req.Query)
+	}
+	return candidate
 }
 
 func classifierSources(req SearchAgentRequest, modelSources []SearchSource) []SearchSource {

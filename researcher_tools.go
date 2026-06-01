@@ -652,14 +652,22 @@ func queryLanguageCompatible(req ResearchRequest, query string) bool {
 }
 
 func prefersChineseSearch(req ResearchRequest) bool {
-	if containsAnyFold(req.Query, "english", "英文", "global source", "international source") {
+	if queryLanguageExplicitlyAllowsEnglish(req.Query) {
 		return false
 	}
-	return containsCJK(req.Query) || containsCJK(req.Classification.StandaloneFollowUp)
+	return prefersChineseQueryText(req.Query) || containsCJK(req.Classification.StandaloneFollowUp)
+}
+
+func prefersChineseQueryText(query string) bool {
+	return containsCJK(query)
+}
+
+func queryLanguageExplicitlyAllowsEnglish(query string) bool {
+	return containsAnyFold(query, "english", "英文", "global source", "global sources", "international source", "international sources")
 }
 
 func chineseSearchFallbackQueries(req ResearchRequest) []string {
-	query := strings.TrimSpace(firstNonEmpty(req.Classification.StandaloneFollowUp, req.Query))
+	query := strings.TrimSpace(firstNonEmpty(req.Query, req.Classification.StandaloneFollowUp))
 	query = resolveRelativeDateQuery(query, req.Now)
 	if query == "" {
 		return nil

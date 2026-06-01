@@ -229,11 +229,36 @@ func TestVaneStyleClassifierOutputAddsSourcesAndStandaloneFollowUp(t *testing.T)
 	if got.SkipSearch || !got.ShouldSearch {
 		t.Fatalf("classification search flags = %#v, want search", got)
 	}
-	if got.StandaloneFollowUp != "Compare agent framework benchmarks and community feedback" {
-		t.Fatalf("StandaloneFollowUp = %q", got.StandaloneFollowUp)
+	if got.StandaloneFollowUp != "那它们 benchmark 和用户反馈呢" {
+		t.Fatalf("StandaloneFollowUp = %q, want latest Chinese query language preserved", got.StandaloneFollowUp)
 	}
 	if !hasSource(got.Sources, SearchSourceAcademic) || !hasSource(got.Sources, SearchSourceDiscussions) {
 		t.Fatalf("sources = %#v, want academic and discussions", got.Sources)
+	}
+}
+
+func TestClassifierPreservesChineseStandaloneFollowUp(t *testing.T) {
+	classifier := &staticTextModel{text: `{
+		"classification": {
+			"skipSearch": false,
+			"personalSearch": false,
+			"academicSearch": false,
+			"discussionSearch": false,
+			"showWeatherWidget": false,
+			"showStockWidget": false,
+			"showCalculationWidget": false
+		},
+		"standaloneFollowUp": "What are the latest market reactions to NVIDIA's new AI PC hardware?"
+	}`}
+	agent := SearchAgent{ClassifierModel: classifier}
+	query := "\u82f1\u4f1f\u8fbe\u63a8\u51fa\u7684\u65b0aipc\u786c\u4ef6 \u5e02\u573a\u53cd\u54cd\u5982\u4f55"
+	got := agent.classify(context.Background(), SearchAgentRequest{
+		Query:   query,
+		Mode:    ModeQuality,
+		Sources: []SearchSource{SearchSourceWeb},
+	})
+	if got.StandaloneFollowUp != query {
+		t.Fatalf("StandaloneFollowUp = %q, want original Chinese query %q", got.StandaloneFollowUp, query)
 	}
 }
 
@@ -693,6 +718,44 @@ func TestChineseSearchQueriesRejectEnglishRepair(t *testing.T) {
 		}
 		if containsAnyFold(query, "Harbin", "tornado", "official report", "casualties", "power outage") {
 			t.Fatalf("query = %q, leaked English repaired query; all=%#v", query, searcher.queries)
+		}
+	}
+}
+
+func TestChineseSearchQueriesRejectEnglishToolQueries(t *testing.T) {
+	searcher := &recordingSearchProvider{}
+	researchModel := &scriptedResearchModel{calls: [][]model.ToolCall{
+		{toolCall("search-1", "web_search", map[string]any{"queries": []string{
+			"NVIDIA AI PC hardware market reaction 2026",
+			"NVIDIA RTX AI PC sales reviews",
+			"NVIDIA AI PC launch feedback",
+		}})},
+		{toolCall("done-1", "done", map[string]any{})},
+	}}
+	researcher := Researcher{ResearchModel: researchModel, SearchProvider: searcher}
+	query := "\u82f1\u4f1f\u8fbe\u63a8\u51fa\u7684\u65b0aipc\u786c\u4ef6 \u5e02\u573a\u53cd\u54cd\u5982\u4f55"
+	_, err := researcher.Research(context.Background(), ResearchRequest{
+		Query: query,
+		Classification: Classification{
+			ShouldSearch:       true,
+			StandaloneFollowUp: "What are the latest market reactions to NVIDIA's new AI PC hardware?",
+			Sources:            []SearchSource{SearchSourceWeb},
+		},
+		Mode:    ModeQuality,
+		Sources: []SearchSource{SearchSourceWeb},
+	})
+	if err != nil {
+		t.Fatalf("Research: %v", err)
+	}
+	if len(searcher.queries) == 0 {
+		t.Fatal("expected Chinese fallback search queries")
+	}
+	for _, query := range searcher.queries {
+		if !containsCJK(query) {
+			t.Fatalf("query = %q, want Chinese fallback query; all=%#v", query, searcher.queries)
+		}
+		if containsAnyFold(query, "NVIDIA AI PC", "market reaction", "launch feedback") {
+			t.Fatalf("query = %q, leaked English tool query; all=%#v", query, searcher.queries)
 		}
 	}
 }
