@@ -676,12 +676,34 @@ func TestResearcherExecutesSearchQueriesConcurrently(t *testing.T) {
 	}
 }
 
-func TestResearcherStopsAfterSoftInformationBudget(t *testing.T) {
-	searcher := &manySearchProvider{}
+func TestSoftInformationBudgetRequiresUsefulQualityResults(t *testing.T) {
+	generic := []SearchResult{
+		{Title: "哈尔滨市_百度百科", URL: "https://baike.baidu.com/item/harbin", Content: strings.Repeat("百科", 20)},
+		{Title: "哈尔滨旅游攻略", URL: "https://example.com/travel", Content: strings.Repeat("旅游", 20)},
+		{Title: "哈尔滨市人民政府", URL: "https://www.harbin.gov.cn/", Content: strings.Repeat("首页", 20)},
+	}
+	if shouldStopAfterSoftInformationBudget(ModeQuality, generic, 1, 1) {
+		t.Fatal("quality soft budget should not stop on generic or short results")
+	}
+	var useful []SearchResult
+	for i := 0; i < 12; i++ {
+		useful = append(useful, SearchResult{
+			Title:   fmt.Sprintf("Harbin storm report %d", i),
+			URL:     fmt.Sprintf("https://news.example.com/%d", i),
+			Content: strings.Repeat("Harbin tornado storm outage traffic damage. ", 30),
+		})
+	}
+	if !shouldStopAfterSoftInformationBudget(ModeQuality, useful, 1, 1) {
+		t.Fatal("quality soft budget should stop after enough useful long-form results")
+	}
+}
+
+func TestResearcherDoesNotSoftStopOnGenericQualityResults(t *testing.T) {
+	searcher := &genericSearchProvider{}
 	researchModel := &scriptedResearchModel{calls: [][]model.ToolCall{
-		{toolCall("search-1", "web_search", map[string]any{"queries": []string{"first angle"}})},
-		{toolCall("search-2", "web_search", map[string]any{"queries": []string{"second angle"}})},
-		{toolCall("search-3", "web_search", map[string]any{"queries": []string{"should not run"}})},
+		{toolCall("search-1", "web_search", map[string]any{"queries": []string{"Harbin storm"}})},
+		{toolCall("search-2", "web_search", map[string]any{"queries": []string{"Harbin storm damage"}})},
+		{toolCall("done-1", "done", map[string]any{})},
 	}}
 	researcher := Researcher{
 		ResearchModel:  researchModel,
@@ -701,8 +723,8 @@ func TestResearcherStopsAfterSoftInformationBudget(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Research: %v", err)
 	}
-	if len(researchModel.requests) != 1 {
-		t.Fatalf("research model requests = %d, want soft budget to stop after first information call", len(researchModel.requests))
+	if len(researchModel.requests) < 2 {
+		t.Fatalf("research model requests = %d, want no soft stop on generic/short quality results", len(researchModel.requests))
 	}
 }
 
@@ -760,6 +782,16 @@ func (p *duplicateURLSearchProvider) Search(_ context.Context, query string, opt
 		Content: "snippet from " + query,
 		Source:  opts.Source,
 	}}, nil
+}
+
+type genericSearchProvider struct{}
+
+func (p *genericSearchProvider) Search(_ context.Context, query string, opts SearchOptions) ([]SearchResult, error) {
+	return []SearchResult{
+		{Title: "哈尔滨市_百度百科", URL: "https://baike.baidu.com/item/harbin", Content: "哈尔滨百科", Source: opts.Source},
+		{Title: "哈尔滨旅游攻略", URL: "https://example.com/travel", Content: "哈尔滨旅游景点", Source: opts.Source},
+		{Title: "哈尔滨市人民政府", URL: "https://www.harbin.gov.cn/", Content: "政府首页", Source: opts.Source},
+	}, nil
 }
 
 type blockingSearchProvider struct {

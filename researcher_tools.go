@@ -66,6 +66,7 @@ func (r Researcher) researchWithTools(ctx context.Context, req ResearchRequest) 
 	usedTools := false
 	failedInfoCalls := 0
 	informationCalls := 0
+	stopReason := "max_iterations"
 	for step := 0; step < iterations; step++ {
 		prompt := getResearcherPrompt(req, step, iterations)
 		ch, err := r.ResearchModel.GenerateContent(ctx, &model.Request{
@@ -213,12 +214,19 @@ func (r Researcher) researchWithTools(ctx context.Context, req ResearchRequest) 
 			}
 		}
 		if done || len(out) >= totalResultLimit(req.Mode) {
+			if done {
+				stopReason = "done"
+			} else {
+				stopReason = "result_limit"
+			}
 			break
 		}
 		if shouldStopAfterSoftInformationBudget(req.Mode, out, informationCalls, firstPositive(req.SoftMaxInformationCalls, r.SoftMaxInformationCalls)) {
+			stopReason = "soft_information_budget"
 			break
 		}
 		if failedInfoCalls >= maxFailedInformationToolCalls(req.Mode) {
+			stopReason = "repeated_information_failures"
 			break
 		}
 	}
@@ -228,6 +236,12 @@ func (r Researcher) researchWithTools(ctx context.Context, req ResearchRequest) 
 		Query:       query,
 		ResultCount: len(out),
 		Results:     append([]SearchResult(nil), out...),
+		Metadata: map[string]any{
+			"stop_reason":       stopReason,
+			"information_calls": informationCalls,
+			"soft_budget":       firstPositive(req.SoftMaxInformationCalls, r.SoftMaxInformationCalls),
+			"useful_results":    countUsefulResultsForStop(req.Mode, out),
+		},
 	})
 	return out, usedTools, firstErr
 }
@@ -254,19 +268,29 @@ func shouldStopAfterSoftInformationBudget(mode Mode, results []SearchResult, cal
 	if budget <= 0 || calls < budget {
 		return false
 	}
-	minResults := 4
-	if mode == ModeQuality {
-		minResults = 8
+	switch mode {
+	case ModeQuality:
+		return countUsefulResultsForStop(mode, results) >= 12
+	case ModeBalanced:
+		return countUsefulResultsForStop(mode, results) >= 6
+	default:
+		return countUsefulResultsForStop(mode, results) >= 3
 	}
-	return countCredibleResults(results) >= minResults
 }
 
-func countCredibleResults(results []SearchResult) int {
+func countUsefulResultsForStop(mode Mode, results []SearchResult) int {
 	count := 0
 	for _, result := range results {
-		if strings.TrimSpace(result.URL) != "" || strings.TrimSpace(result.Content) != "" {
-			count++
+		if strings.TrimSpace(result.URL) == "" && strings.TrimSpace(result.Content) == "" {
+			continue
 		}
+		if mode == ModeQuality && genericSearchResult(result) {
+			continue
+		}
+		if mode == ModeQuality && strings.TrimSpace(result.URL) != "" && len([]rune(strings.TrimSpace(result.Content))) < 500 {
+			continue
+		}
+		count++
 	}
 	return count
 }
