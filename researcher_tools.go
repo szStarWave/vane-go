@@ -330,7 +330,7 @@ func (r Researcher) executeQueries(ctx context.Context, req ResearchRequest, sou
 	if len(queries) == 0 {
 		queries = []string{firstNonEmpty(req.Classification.StandaloneFollowUp, req.Query)}
 	}
-	queries = uniqueStrings(queries)
+	queries = r.planSearchQueries(ctx, req, source, queries)
 	if len(queries) > 3 {
 		queries = queries[:3]
 	}
@@ -357,6 +357,85 @@ func (r Researcher) executeQueries(ctx context.Context, req ResearchRequest, sou
 		all = all[:totalResultLimit(req.Mode)]
 	}
 	return all, firstErr
+}
+
+func (r Researcher) planSearchQueries(ctx context.Context, req ResearchRequest, source SearchSource, candidates []string) []string {
+	candidates = uniqueStrings(candidates)
+	if len(candidates) == 0 || r.ResearchModel == nil || source == SearchSourceUploads {
+		return candidates
+	}
+	now := time.Now()
+	if !req.Now.IsZero() {
+		now = req.Now
+	}
+	var b strings.Builder
+	for i, query := range candidates {
+		fmt.Fprintf(&b, "%d. %s\n", i+1, resolveRelativeDateQuery(query, req.Now))
+	}
+	ch, err := r.ResearchModel.GenerateContent(ctx, &model.Request{
+		Messages: []model.Message{
+			model.NewSystemMessage(`You are Vane's search query planner. Return compact JSON only: {"queries":["..."]}.
+Rewrite candidate queries into search-engine-friendly keyword queries.
+Rules:
+- Return 1 to 3 queries.
+- Do not return full natural-language sentences.
+- Preserve the user's entities, locations, absolute dates/time ranges, and core constraints.
+- Split complex requests into complementary angles instead of repeating the same query.
+- Keep each query short and specific.
+- Use the user's language unless another language is necessary for the topic.`),
+			model.NewUserMessage(fmt.Sprintf(
+				"Current date: %s\nMode: %s\nSource: %s\nUser query: %s\nStandalone question: %s\nCandidate queries:\n%s",
+				now.Format("2006-01-02"),
+				req.Mode,
+				source,
+				req.Query,
+				firstNonEmpty(req.Classification.StandaloneFollowUp, req.Query),
+				b.String(),
+			)),
+		},
+		GenerationConfig: model.GenerationConfig{Stream: false, Temperature: floatPtr(0), MaxTokens: intPtr(220)},
+	})
+	if err != nil {
+		return limitSearchQueries(candidates)
+	}
+	text, err := collectResponseText(ctx, ch)
+	if err != nil {
+		return limitSearchQueries(candidates)
+	}
+	var parsed struct {
+		Queries []string `json:"queries"`
+	}
+	if err := json.Unmarshal([]byte(extractJSONObject(text)), &parsed); err != nil {
+		return limitSearchQueries(candidates)
+	}
+	planned := sanitizePlannedQueries(parsed.Queries)
+	if len(planned) == 0 {
+		return limitSearchQueries(candidates)
+	}
+	return planned
+}
+
+func limitSearchQueries(queries []string) []string {
+	queries = uniqueStrings(queries)
+	if len(queries) > 3 {
+		return queries[:3]
+	}
+	return queries
+}
+
+func sanitizePlannedQueries(queries []string) []string {
+	var out []string
+	for _, query := range queries {
+		query = strings.TrimSpace(query)
+		if query == "" || len([]rune(query)) > 96 {
+			continue
+		}
+		out = append(out, query)
+		if len(out) >= 3 {
+			break
+		}
+	}
+	return uniqueStrings(out)
 }
 
 func (r Researcher) rankAndDedupe(ctx context.Context, queries []string, results []SearchResult, mode Mode) []SearchResult {

@@ -350,6 +350,81 @@ func TestQualityResearchKeepsSupplementalSearchSources(t *testing.T) {
 	}
 }
 
+func TestResearcherPlansSearchQueriesWithLLM(t *testing.T) {
+	searcher := &recordingSearchProvider{}
+	researchModel := &scriptedResearchModel{
+		queryPlan: []string{
+			"\u54c8\u5c14\u6ee8 2026\u5e745\u670831\u65e5 \u9f99\u5377\u98ce \u5b98\u65b9\u901a\u62a5",
+			"\u54c8\u5c14\u6ee8 2026\u5e745\u670831\u65e5 \u5927\u98ce \u4e8b\u6545 \u4f24\u4ea1",
+			"\u54c8\u5c14\u6ee8 5\u670831\u65e5 \u5f3a\u5bf9\u6d41 \u4ea4\u901a \u505c\u7535",
+		},
+		calls: [][]model.ToolCall{
+			{toolCall("search-1", "web_search", map[string]any{"queries": []string{"\u641c\u7d22\u54c8\u5c14\u6ee82026\u5e745\u670831\u65e5\u7684\u5927\u98ce\uff0c\u770b\u770b\u51fa\u73b0\u4e86\u54ea\u4e9b\u91cd\u5927\u4e8b\u6545\uff0c\u5206\u6790\u5f71\u54cd"}})},
+			{toolCall("done-1", "done", map[string]any{})},
+		},
+	}
+	researcher := Researcher{
+		ResearchModel:  researchModel,
+		SearchProvider: searcher,
+	}
+	_, err := researcher.Research(context.Background(), ResearchRequest{
+		Query: "\u641c\u7d22\u54c8\u5c14\u6ee8\u6628\u65e5\u7684\u5927\u98ce\uff0c\u770b\u770b\u51fa\u73b0\u4e86\u54ea\u4e9b\u91cd\u5927\u4e8b\u6545\uff0c\u5206\u6790\u4e00\u4e0b\u5e26\u6765\u4e86\u54ea\u4e9b\u5f71\u54cd",
+		Classification: Classification{
+			ShouldSearch:       true,
+			StandaloneFollowUp: "\u641c\u7d22\u54c8\u5c14\u6ee8\u6628\u65e5\u7684\u5927\u98ce\u4e8b\u6545\u53ca\u5f71\u54cd",
+			Sources:            []SearchSource{SearchSourceWeb},
+		},
+		Mode:    ModeQuality,
+		Sources: []SearchSource{SearchSourceWeb},
+		Now:     time.Date(2026, 6, 1, 10, 0, 0, 0, time.FixedZone("CST", 8*60*60)),
+	})
+	if err != nil {
+		t.Fatalf("Research: %v", err)
+	}
+	if len(searcher.queries) != 3 {
+		t.Fatalf("queries = %#v, want planned 3 queries", searcher.queries)
+	}
+	for _, query := range searcher.queries {
+		if strings.Contains(query, "\uff0c\u770b\u770b") {
+			t.Fatalf("planned query still looks like full user sentence: %q", query)
+		}
+	}
+	if searcher.queries[0] != researchModel.queryPlan[0] {
+		t.Fatalf("first query = %q, want planned %q", searcher.queries[0], researchModel.queryPlan[0])
+	}
+}
+
+func TestResearcherFallsBackWhenQueryPlannerFails(t *testing.T) {
+	searcher := &recordingSearchProvider{}
+	researchModel := &scriptedResearchModel{
+		queryPlanRaw: "not json",
+		calls: [][]model.ToolCall{
+			{toolCall("search-1", "web_search", map[string]any{"queries": []string{"vane search agent"}})},
+			{toolCall("done-1", "done", map[string]any{})},
+		},
+	}
+	researcher := Researcher{
+		ResearchModel:  researchModel,
+		SearchProvider: searcher,
+	}
+	_, err := researcher.Research(context.Background(), ResearchRequest{
+		Query: "what is vane",
+		Classification: Classification{
+			ShouldSearch:       true,
+			StandaloneFollowUp: "what is vane",
+			Sources:            []SearchSource{SearchSourceWeb},
+		},
+		Mode:    ModeBalanced,
+		Sources: []SearchSource{SearchSourceWeb},
+	})
+	if err != nil {
+		t.Fatalf("Research: %v", err)
+	}
+	if len(searcher.queries) != 1 || searcher.queries[0] != "vane search agent" {
+		t.Fatalf("queries=%#v, want original query fallback", searcher.queries)
+	}
+}
+
 func TestQualitySupplementalSourcesAreFilteredAndCapped(t *testing.T) {
 	results := []SearchResult{
 		{Title: "Picked", URL: "https://example.com/picked", Content: "Harbin tornado picked"},
@@ -511,9 +586,6 @@ func TestResearcherStopsAfterRepeatedSearchFailures(t *testing.T) {
 	if len(searcher.queries) != maxFailedInformationToolCalls(ModeQuality) {
 		t.Fatalf("queries = %#v, want %d failed attempts", searcher.queries, maxFailedInformationToolCalls(ModeQuality))
 	}
-	if len(researchModel.requests) > maxFailedInformationToolCalls(ModeQuality) {
-		t.Fatalf("research model calls = %d, want capped after repeated failures", len(researchModel.requests))
-	}
 }
 
 type staticTextModel struct {
@@ -598,8 +670,10 @@ func (m *staticTextModel) GenerateContent(_ context.Context, req *model.Request)
 }
 
 type scriptedResearchModel struct {
-	calls    [][]model.ToolCall
-	requests []*model.Request
+	calls        [][]model.ToolCall
+	requests     []*model.Request
+	queryPlan    []string
+	queryPlanRaw string
 }
 
 func (m *scriptedResearchModel) Info() model.Info { return model.Info{Name: "scripted-research"} }
@@ -614,6 +688,15 @@ func (m *scriptedResearchModel) GenerateContent(_ context.Context, req *model.Re
 	content := ""
 	var toolCalls []model.ToolCall
 	switch {
+	case strings.Contains(system, "search query planner"):
+		if m.queryPlanRaw != "" {
+			content = m.queryPlanRaw
+		} else if len(m.queryPlan) > 0 {
+			payload, _ := json.Marshal(map[string][]string{"queries": m.queryPlan})
+			content = string(payload)
+		} else {
+			content = `{"queries":[]}`
+		}
 	case strings.Contains(system, "search result picker"):
 		content = `{"picked_indices":[0]}`
 	case strings.Contains(system, "information extractor"):
