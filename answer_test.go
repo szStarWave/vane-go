@@ -61,8 +61,8 @@ func TestAnswerUsesSearchResultsInWriterPrompt(t *testing.T) {
 	}
 	for range ch {
 	}
-	if len(searcher.queries) != 3 {
-		t.Fatalf("queries = %v, want 3 balanced queries", searcher.queries)
+	if len(searcher.queries) != 6 {
+		t.Fatalf("queries = %v, want 6 balanced research queries", searcher.queries)
 	}
 	if base.req == nil || len(base.req.Messages) == 0 {
 		t.Fatal("base model did not receive writer request")
@@ -96,18 +96,39 @@ func TestAnswerEmitsSearchEvents(t *testing.T) {
 	}
 	for range ch {
 	}
-	if len(events) != 4 {
-		t.Fatalf("events = %#v, want start/query/results/end", events)
+	if !hasEventType(events, SearchEventClassification) ||
+		!hasEventType(events, SearchEventStart) ||
+		!hasEventType(events, SearchEventResearchStart) ||
+		!hasEventType(events, SearchEventToolCall) ||
+		!hasEventType(events, SearchEventToolResult) ||
+		!hasEventType(events, SearchEventSourceBlock) ||
+		!hasEventType(events, SearchEventWriterStart) ||
+		!hasEventType(events, SearchEventWriterEnd) {
+		t.Fatalf("events missing full search pipeline events: %#v", events)
 	}
-	if events[0].Type != SearchEventStart || events[1].Type != SearchEventQuery || events[2].Type != SearchEventResults || events[3].Type != SearchEventEnd {
-		t.Fatalf("event order = %#v", []SearchEventType{events[0].Type, events[1].Type, events[2].Type, events[3].Type})
+	end := lastEventOfType(events, SearchEventEnd)
+	if end == nil {
+		t.Fatalf("missing end event: %#v", events)
 	}
-	if events[3].ResultCount != 2 {
-		t.Fatalf("end result count = %d, want 2 deduped results", events[3].ResultCount)
+	if end.ResultCount != 2 {
+		t.Fatalf("end result count = %d, want 2 deduped results", end.ResultCount)
 	}
-	if len(events[3].Results) != 2 || events[3].Results[0].URL != "https://example.com/a#x" {
-		t.Fatalf("end results = %#v, want deduped sources", events[3].Results)
+	if len(end.Results) != 2 || end.Results[0].URL != "https://example.com/a#x" {
+		t.Fatalf("end results = %#v, want deduped sources", end.Results)
 	}
+}
+
+func hasEventType(events []SearchEvent, typ SearchEventType) bool {
+	return lastEventOfType(events, typ) != nil
+}
+
+func lastEventOfType(events []SearchEvent, typ SearchEventType) *SearchEvent {
+	for i := len(events) - 1; i >= 0; i-- {
+		if events[i].Type == typ {
+			return &events[i]
+		}
+	}
+	return nil
 }
 
 func TestNormalizeMode(t *testing.T) {
