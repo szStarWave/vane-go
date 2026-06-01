@@ -331,6 +331,7 @@ func (r Researcher) executeQueries(ctx context.Context, req ResearchRequest, sou
 		queries = []string{firstNonEmpty(req.Classification.StandaloneFollowUp, req.Query)}
 	}
 	queries = uniqueStrings(queries)
+	queries = r.repairSearchQueries(ctx, req, source, queries)
 	if len(queries) > 3 {
 		queries = queries[:3]
 	}
@@ -357,6 +358,98 @@ func (r Researcher) executeQueries(ctx context.Context, req ResearchRequest, sou
 		all = all[:totalResultLimit(req.Mode)]
 	}
 	return all, firstErr
+}
+
+func (r Researcher) repairSearchQueries(ctx context.Context, req ResearchRequest, source SearchSource, queries []string) []string {
+	if r.ResearchModel == nil || source == SearchSourceUploads || !needsQueryRepair(queries) {
+		return queries
+	}
+	now := time.Now()
+	if !req.Now.IsZero() {
+		now = req.Now
+	}
+	var b strings.Builder
+	for i, query := range queries {
+		fmt.Fprintf(&b, "%d. %s\n", i+1, resolveRelativeDateQuery(query, req.Now))
+	}
+	ch, err := r.ResearchModel.GenerateContent(ctx, &model.Request{
+		Messages: []model.Message{
+			model.NewSystemMessage(`You are Vane's search query repairer. Return compact JSON only: {"queries":["..."]}.
+Only rewrite bad search queries that look like full user sentences or verbose conversational text.
+Return 1 to 3 search-engine-friendly keyword queries.
+Preserve entities, locations, dates, and constraints.
+Use short Chinese keyword queries for Chinese local/news questions.
+If the input queries are already good keyword queries, return them unchanged.`),
+			model.NewUserMessage(fmt.Sprintf(
+				"Current date: %s\nMode: %s\nSource: %s\nUser query: %s\nStandalone question: %s\nQueries to repair:\n%s",
+				now.Format("2006-01-02"),
+				req.Mode,
+				source,
+				req.Query,
+				firstNonEmpty(req.Classification.StandaloneFollowUp, req.Query),
+				b.String(),
+			)),
+		},
+		GenerationConfig: model.GenerationConfig{Stream: false, Temperature: floatPtr(0), MaxTokens: intPtr(220)},
+	})
+	if err != nil {
+		return queries
+	}
+	text, err := collectResponseText(ctx, ch)
+	if err != nil {
+		return queries
+	}
+	var parsed struct {
+		Queries []string `json:"queries"`
+	}
+	if err := json.Unmarshal([]byte(extractJSONObject(text)), &parsed); err != nil {
+		return queries
+	}
+	repaired := sanitizeRepairedQueries(parsed.Queries)
+	if len(repaired) == 0 {
+		return queries
+	}
+	return repaired
+}
+
+func needsQueryRepair(queries []string) bool {
+	for _, query := range queries {
+		if looksLikeVerboseSearchQuery(query) {
+			return true
+		}
+	}
+	return false
+}
+
+func looksLikeVerboseSearchQuery(query string) bool {
+	query = strings.TrimSpace(query)
+	runes := []rune(query)
+	if len(runes) > 38 {
+		return true
+	}
+	verbosePhrases := []string{"搜索", "看看", "分析", "一下", "哪些", "如何", "为什么", "please", "tell me", "what are", "how does"}
+	lower := strings.ToLower(query)
+	for _, phrase := range verbosePhrases {
+		if strings.Contains(lower, phrase) {
+			return true
+		}
+	}
+	return strings.Count(query, " ") > 8 || strings.Count(query, "，")+strings.Count(query, ",") > 1
+}
+
+func sanitizeRepairedQueries(queries []string) []string {
+	var out []string
+	for _, query := range queries {
+		query = strings.TrimSpace(query)
+		if query == "" || len([]rune(query)) > 80 || looksLikeVerboseSearchQuery(query) {
+			continue
+		}
+		out = append(out, query)
+		if len(out) >= 3 {
+			break
+		}
+	}
+	return uniqueStrings(out)
 }
 
 func (r Researcher) rankAndDedupe(ctx context.Context, queries []string, results []SearchResult, mode Mode) []SearchResult {
