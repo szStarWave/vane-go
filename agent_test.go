@@ -11,7 +11,7 @@ import (
 
 func TestClassifierSkipsConversationalQuery(t *testing.T) {
 	got := classifySearch(SearchAgentRequest{
-		Query:   "你好",
+		Query:   "\u4f60\u597d",
 		Mode:    ModeBalanced,
 		Sources: []SearchSource{SearchSourceWeb},
 	})
@@ -29,7 +29,7 @@ func TestClassifierDetectsWidgets(t *testing.T) {
 		text string
 		want func(Classification) bool
 	}{
-		{name: "weather", text: "上海今天的天气怎么样", want: func(c Classification) bool { return c.NeedWeather }},
+		{name: "weather", text: "\u4e0a\u6d77\u4eca\u5929\u7684\u5929\u6c14\u600e\u4e48\u6837", want: func(c Classification) bool { return c.NeedWeather }},
 		{name: "stock", text: "NVDA stock price latest", want: func(c Classification) bool { return c.NeedStock }},
 		{name: "calc", text: "calculate 12*(3+4)", want: func(c Classification) bool { return c.NeedCalc }},
 	}
@@ -62,22 +62,48 @@ func TestResearcherUsesModeIterationCounts(t *testing.T) {
 	}
 }
 
-func TestResearchQueriesResolveHarbinYesterdayWindQuestion(t *testing.T) {
+func TestTemporalQueryExpanderResolvesRelativeDates(t *testing.T) {
 	now := time.Date(2026, 6, 1, 10, 0, 0, 0, time.UTC)
-	query := "搜索哈尔滨昨日的大风，看看出现了哪些重大事故，分析一下带来了哪些影响"
+	expansion := expandTemporalQuery("search yesterday storm impact", now)
+	if strings.Contains(strings.ToLower(expansion.Query), "yesterday") {
+		t.Fatalf("query still contains relative date: %q", expansion.Query)
+	}
+	if !strings.Contains(expansion.Query, "2026-05-31") {
+		t.Fatalf("query = %q, want absolute date 2026-05-31", expansion.Query)
+	}
+	if len(expansion.Dates) == 0 || expansion.Dates[0] != "2026\u5e745\u670831\u65e5" {
+		t.Fatalf("dates = %#v, want Chinese date label", expansion.Dates)
+	}
+}
+
+func TestTemporalQueryExpanderAddsEventImpactVariants(t *testing.T) {
+	now := time.Date(2026, 6, 1, 10, 0, 0, 0, time.UTC)
+	query := "\u641c\u7d22\u54c8\u5c14\u6ee8\u6628\u65e5\u7684\u5927\u98ce\uff0c\u770b\u770b\u51fa\u73b0\u4e86\u54ea\u4e9b\u91cd\u5927\u4e8b\u6545\uff0c\u5206\u6790\u4e00\u4e0b\u5e26\u6765\u4e86\u54ea\u4e9b\u5f71\u54cd"
 	queries := buildResearchQueries(query, ModeQuality, 25, now)
 	if len(queries) == 0 {
 		t.Fatal("expected research queries")
 	}
 	first := queries[0]
-	if strings.Contains(first, "昨日") || strings.Contains(first, "昨天") {
+	if strings.Contains(first, "\u6628\u65e5") || strings.Contains(first, "\u6628\u5929") {
 		t.Fatalf("query still contains relative date: %q", first)
 	}
-	if !strings.Contains(first, "2026年5月31日") {
-		t.Fatalf("query = %q, want absolute date 2026年5月31日", first)
+	if !strings.Contains(first, "2026\u5e745\u670831\u65e5") {
+		t.Fatalf("query = %q, want absolute date 2026\u5e745\u670831\u65e5", first)
 	}
-	if !strings.Contains(first, "哈尔滨") || !strings.Contains(first, "大风") {
+	if !strings.Contains(first, "\u54c8\u5c14\u6ee8") || !strings.Contains(first, "\u5927\u98ce") {
 		t.Fatalf("query = %q, want Harbin wind terms", first)
+	}
+	joined := strings.Join(queries, "\n")
+	if !strings.Contains(joined, "\u5b98\u65b9\u901a\u62a5") || !strings.Contains(joined, "\u4f24\u4ea1") {
+		t.Fatalf("queries missing disaster/impact variants: %#v", queries)
+	}
+}
+
+func TestTemporalReplacementOnlyReplacesMatchedPhrase(t *testing.T) {
+	now := time.Date(2026, 6, 1, 10, 0, 0, 0, time.UTC)
+	got := resolveRelativeDateQuery("today and yesterday", now)
+	if !strings.Contains(got, "2026-06-01") || !strings.Contains(got, "2026-05-31") {
+		t.Fatalf("query = %q, want both today and yesterday dates", got)
 	}
 }
 
@@ -86,7 +112,7 @@ func TestSearchAgentHarbinQuestionUsesAbsoluteDateQueries(t *testing.T) {
 	searcher := &recordingSearchProvider{}
 	agent := SearchAgent{SearchProvider: searcher}
 	_, err := agent.Run(context.Background(), SearchAgentRequest{
-		Query:         "搜索哈尔滨昨日的大风，看看出现了哪些重大事故，分析一下带来了哪些影响",
+		Query:         "\u641c\u7d22\u54c8\u5c14\u6ee8\u6628\u65e5\u7684\u5927\u98ce\uff0c\u770b\u770b\u51fa\u73b0\u4e86\u54ea\u4e9b\u91cd\u5927\u4e8b\u6545\uff0c\u5206\u6790\u4e00\u4e0b\u5e26\u6765\u4e86\u54ea\u4e9b\u5f71\u54cd",
 		Mode:          ModeQuality,
 		Sources:       []SearchSource{SearchSourceWeb},
 		MaxIterations: 2,
@@ -99,11 +125,11 @@ func TestSearchAgentHarbinQuestionUsesAbsoluteDateQueries(t *testing.T) {
 		t.Fatal("expected search queries")
 	}
 	for _, query := range searcher.queries {
-		if strings.Contains(query, "昨日") || strings.Contains(query, "昨天") {
+		if strings.Contains(query, "\u6628\u65e5") || strings.Contains(query, "\u6628\u5929") {
 			t.Fatalf("search query still contains relative date: %q", query)
 		}
 	}
-	if !strings.Contains(searcher.queries[0], "2026年5月31日") {
+	if !strings.Contains(searcher.queries[0], "2026\u5e745\u670831\u65e5") {
 		t.Fatalf("first query = %q, want absolute date", searcher.queries[0])
 	}
 }
@@ -117,8 +143,8 @@ func TestSearchAgentEmitsWidgetAndFallsBackWhenProviderMissing(t *testing.T) {
 		},
 	}
 	_, err := agent.Run(context.Background(), SearchAgentRequest{
-		Query:    "上海天气",
-		Messages: []model.Message{model.NewUserMessage("上海天气")},
+		Query:    "\u4e0a\u6d77\u5929\u6c14",
+		Messages: []model.Message{model.NewUserMessage("\u4e0a\u6d77\u5929\u6c14")},
 		Mode:     ModeSpeed,
 	})
 	if err != nil {
@@ -189,9 +215,9 @@ type recordingSearchProvider struct {
 func (p *recordingSearchProvider) Search(_ context.Context, query string, _ SearchOptions) ([]SearchResult, error) {
 	p.queries = append(p.queries, query)
 	return []SearchResult{{
-		Title:   "哈尔滨强对流天气",
+		Title:   "\u54c8\u5c14\u6ee8\u5f3a\u5bf9\u6d41\u5929\u6c14",
 		URL:     "https://example.com/harbin-tornado",
-		Content: "2026年5月31日哈尔滨出现大风和龙卷风相关报道。",
+		Content: "2026\u5e745\u670831\u65e5\u54c8\u5c14\u6ee8\u51fa\u73b0\u5927\u98ce\u548c\u9f99\u5377\u98ce\u76f8\u5173\u62a5\u9053\u3002",
 	}}, nil
 }
 

@@ -537,8 +537,10 @@ func (r Researcher) runAction(ctx context.Context, req ResearchRequest, source S
 }
 
 func buildResearchQueries(query string, mode Mode, iterations int, now time.Time) []string {
-	query = resolveRelativeDateQuery(query, now)
+	expansion := expandTemporalQuery(query, now)
+	query = expansion.Query
 	base := buildQueries(query, mode)
+	base = append(base, expansion.Variants...)
 	extras := []string{
 		query + " key facts",
 		query + " recent developments",
@@ -573,6 +575,41 @@ func buildResearchQueries(query string, mode Mode, iterations int, now time.Time
 	return queries
 }
 
+type temporalQueryExpansion struct {
+	Query    string
+	Variants []string
+	Dates    []string
+}
+
+func expandTemporalQuery(query string, now time.Time) temporalQueryExpansion {
+	resolved := resolveRelativeDateQuery(query, now)
+	expansion := temporalQueryExpansion{Query: resolved}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	for _, date := range relativeDateMatches(query, now) {
+		expansion.Dates = append(expansion.Dates, date.Label)
+	}
+	if len(expansion.Dates) == 0 {
+		return expansion
+	}
+	terms := eventImpactTerms(query)
+	for _, date := range expansion.Dates {
+		expansion.Variants = append(expansion.Variants, resolved+" "+date)
+		for _, term := range terms {
+			expansion.Variants = append(expansion.Variants, resolved+" "+date+" "+term)
+		}
+	}
+	return expansion
+}
+
+type relativeDateMatch struct {
+	Label      string
+	ISO        string
+	RangeLabel string
+	Phrases    []string
+}
+
 func resolveRelativeDateQuery(query string, now time.Time) string {
 	if strings.TrimSpace(query) == "" {
 		return query
@@ -580,23 +617,121 @@ func resolveRelativeDateQuery(query string, now time.Time) string {
 	if now.IsZero() {
 		now = time.Now().UTC()
 	}
-	yesterday := now.AddDate(0, 0, -1)
-	dateText := fmt.Sprintf("%d\u5e74%d\u6708%d\u65e5", yesterday.Year(), int(yesterday.Month()), yesterday.Day())
-	replacements := []struct {
-		from string
-		to   string
-	}{
-		{from: "\u6628\u65e5", to: dateText},
-		{from: "\u6628\u5929", to: dateText},
-		{from: "yesterday", to: yesterday.Format("2006-01-02")},
-	}
 	out := query
-	for _, replacement := range replacements {
+	for _, replacement := range relativeDateReplacements(query, now) {
 		out = strings.ReplaceAll(out, replacement.from, replacement.to)
 		out = strings.ReplaceAll(out, strings.ToUpper(replacement.from), replacement.to)
 		out = strings.ReplaceAll(out, titleASCII(replacement.from), replacement.to)
 	}
 	return out
+}
+
+func relativeDateReplacements(query string, now time.Time) []struct{ from, to string } {
+	matches := relativeDateMatches(query, now)
+	out := make([]struct{ from, to string }, 0, len(matches)*4)
+	for _, match := range matches {
+		to := match.Label
+		if match.RangeLabel != "" {
+			to = match.RangeLabel
+		}
+		for _, phrase := range match.Phrases {
+			if isASCII(phrase) {
+				to = match.ISO
+				if match.RangeLabel != "" {
+					to = match.RangeLabel
+				}
+			}
+			out = append(out, struct{ from, to string }{from: phrase, to: to})
+		}
+	}
+	return out
+}
+
+func relativeDateMatches(query string, now time.Time) []relativeDateMatch {
+	lower := strings.ToLower(query)
+	addDay := func(days int, phrases ...string) relativeDateMatch {
+		date := now.AddDate(0, 0, days)
+		return relativeDateMatch{
+			Label:   fmt.Sprintf("%d\u5e74%d\u6708%d\u65e5", date.Year(), int(date.Month()), date.Day()),
+			ISO:     date.Format("2006-01-02"),
+			Phrases: phrases,
+		}
+	}
+	var matches []relativeDateMatch
+	if phrases := matchedRelativePhrases(query, lower, "\u4eca\u5929", "\u4eca\u65e5", "today"); len(phrases) > 0 {
+		matches = append(matches, addDay(0, phrases...))
+	}
+	if phrases := matchedRelativePhrases(query, lower, "\u6628\u5929", "\u6628\u65e5", "yesterday"); len(phrases) > 0 {
+		matches = append(matches, addDay(-1, phrases...))
+	}
+	if phrases := matchedRelativePhrases(query, lower, "\u524d\u5929", "day before yesterday"); len(phrases) > 0 {
+		matches = append(matches, addDay(-2, phrases...))
+	}
+	if phrases := matchedRelativePhrases(query, lower, "\u4e0a\u5468", "last week"); len(phrases) > 0 {
+		start := now.AddDate(0, 0, -7)
+		matches = append(matches, relativeDateMatch{
+			Label:      fmt.Sprintf("%d\u5e74%d\u6708%d\u65e5", start.Year(), int(start.Month()), start.Day()),
+			ISO:        start.Format("2006-01-02"),
+			RangeLabel: fmt.Sprintf("%s..%s", start.Format("2006-01-02"), now.Format("2006-01-02")),
+			Phrases:    phrases,
+		})
+	}
+	if phrases := matchedRelativePhrases(query, lower, "\u6700\u8fd1", "\u8fd1\u65e5", "recent", "latest"); len(phrases) > 0 {
+		start := now.AddDate(0, 0, -7)
+		matches = append(matches, relativeDateMatch{
+			Label:      fmt.Sprintf("%d\u5e74%d\u6708%d\u65e5", start.Year(), int(start.Month()), start.Day()),
+			ISO:        start.Format("2006-01-02"),
+			RangeLabel: fmt.Sprintf("%s..%s", start.Format("2006-01-02"), now.Format("2006-01-02")),
+			Phrases:    phrases,
+		})
+	}
+	return matches
+}
+
+func matchedRelativePhrases(query, lower string, phrases ...string) []string {
+	var out []string
+	for _, phrase := range phrases {
+		if isASCII(phrase) {
+			if strings.Contains(lower, strings.ToLower(phrase)) {
+				out = append(out, phrase)
+			}
+			continue
+		}
+		if strings.Contains(query, phrase) {
+			out = append(out, phrase)
+		}
+	}
+	return out
+}
+
+func isASCII(value string) bool {
+	for i := 0; i < len(value); i++ {
+		if value[i] > 127 {
+			return false
+		}
+	}
+	return true
+}
+
+func eventImpactTerms(query string) []string {
+	lower := strings.ToLower(query)
+	if !containsAny(query, "\u5927\u98ce", "\u9f99\u5377\u98ce", "\u66b4\u96e8", "\u707e\u5bb3", "\u4e8b\u6545", "\u5f71\u54cd", "\u4f24\u4ea1", "\u635f\u5931") &&
+		!containsAny(lower, "wind", "tornado", "storm", "disaster", "accident", "impact", "damage", "casualty") {
+		return nil
+	}
+	return []string{
+		"\u4e8b\u6545",
+		"\u4f24\u4ea1",
+		"\u635f\u5931",
+		"\u4ea4\u901a",
+		"\u505c\u7535",
+		"\u505c\u8fd0",
+		"\u5b98\u65b9\u901a\u62a5",
+		"impact",
+		"damage",
+		"casualties",
+		"official report",
+	}
 }
 
 func titleASCII(value string) string {
