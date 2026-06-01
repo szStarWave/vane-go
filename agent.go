@@ -13,24 +13,28 @@ import (
 )
 
 type SearchAgent struct {
-	ClassifierModel       model.Model
-	ResearchModel         model.Model
-	SearchProvider        SearchProvider
-	ScrapeProvider        ScrapeProvider
-	EmbeddingProvider     EmbeddingProvider
-	TextEmbeddingProvider TextEmbeddingProvider
-	WidgetProviders       WidgetProviders
-	OnSearchEvent         func(context.Context, SearchEvent)
+	ClassifierModel         model.Model
+	ResearchModel           model.Model
+	SearchProvider          SearchProvider
+	ScrapeProvider          ScrapeProvider
+	EmbeddingProvider       EmbeddingProvider
+	TextEmbeddingProvider   TextEmbeddingProvider
+	WidgetProviders         WidgetProviders
+	OnSearchEvent           func(context.Context, SearchEvent)
+	Concurrency             int
+	SoftMaxInformationCalls int
 }
 
 type SearchAgentRequest struct {
-	Query         string
-	Messages      []model.Message
-	Mode          Mode
-	Sources       []SearchSource
-	FileIDs       []string
-	MaxIterations int
-	Now           time.Time
+	Query                   string
+	Messages                []model.Message
+	Mode                    Mode
+	Sources                 []SearchSource
+	FileIDs                 []string
+	MaxIterations           int
+	Concurrency             int
+	SoftMaxInformationCalls int
+	Now                     time.Time
 }
 
 type SearchAgentResult struct {
@@ -66,22 +70,26 @@ func (a SearchAgent) Run(ctx context.Context, req SearchAgentRequest) (SearchAge
 		return SearchAgentResult{Classification: classification, Widgets: widgets}, nil
 	}
 	researcher := Researcher{
-		ResearchModel:         firstModel(a.ResearchModel, a.ClassifierModel),
-		SearchProvider:        a.SearchProvider,
-		ScrapeProvider:        a.ScrapeProvider,
-		EmbeddingProvider:     a.EmbeddingProvider,
-		TextEmbeddingProvider: a.TextEmbeddingProvider,
-		OnSearchEvent:         a.OnSearchEvent,
+		ResearchModel:           firstModel(a.ResearchModel, a.ClassifierModel),
+		SearchProvider:          a.SearchProvider,
+		ScrapeProvider:          a.ScrapeProvider,
+		EmbeddingProvider:       a.EmbeddingProvider,
+		TextEmbeddingProvider:   a.TextEmbeddingProvider,
+		OnSearchEvent:           a.OnSearchEvent,
+		Concurrency:             firstPositive(req.Concurrency, a.Concurrency),
+		SoftMaxInformationCalls: firstPositive(req.SoftMaxInformationCalls, a.SoftMaxInformationCalls),
 	}
 	sources, err := researcher.Research(ctx, ResearchRequest{
-		Query:          req.Query,
-		Messages:       req.Messages,
-		Classification: classification,
-		Mode:           mode,
-		Sources:        classification.Sources,
-		FileIDs:        req.FileIDs,
-		MaxIterations:  req.MaxIterations,
-		Now:            req.Now,
+		Query:                   req.Query,
+		Messages:                req.Messages,
+		Classification:          classification,
+		Mode:                    mode,
+		Sources:                 classification.Sources,
+		FileIDs:                 req.FileIDs,
+		MaxIterations:           req.MaxIterations,
+		Concurrency:             req.Concurrency,
+		SoftMaxInformationCalls: req.SoftMaxInformationCalls,
+		Now:                     req.Now,
 	})
 	emitSearchEvent(ctx, a.OnSearchEvent, SearchEvent{
 		Type:        SearchEventSourceBlock,
@@ -451,23 +459,27 @@ func (a SearchAgent) runWidgets(ctx context.Context, query string, classificatio
 }
 
 type Researcher struct {
-	ResearchModel         model.Model
-	SearchProvider        SearchProvider
-	ScrapeProvider        ScrapeProvider
-	EmbeddingProvider     EmbeddingProvider
-	TextEmbeddingProvider TextEmbeddingProvider
-	OnSearchEvent         func(context.Context, SearchEvent)
+	ResearchModel           model.Model
+	SearchProvider          SearchProvider
+	ScrapeProvider          ScrapeProvider
+	EmbeddingProvider       EmbeddingProvider
+	TextEmbeddingProvider   TextEmbeddingProvider
+	OnSearchEvent           func(context.Context, SearchEvent)
+	Concurrency             int
+	SoftMaxInformationCalls int
 }
 
 type ResearchRequest struct {
-	Query          string
-	Messages       []model.Message
-	Classification Classification
-	Mode           Mode
-	Sources        []SearchSource
-	FileIDs        []string
-	MaxIterations  int
-	Now            time.Time
+	Query                   string
+	Messages                []model.Message
+	Classification          Classification
+	Mode                    Mode
+	Sources                 []SearchSource
+	FileIDs                 []string
+	MaxIterations           int
+	Concurrency             int
+	SoftMaxInformationCalls int
+	Now                     time.Time
 }
 
 func (r Researcher) Research(ctx context.Context, req ResearchRequest) ([]SearchResult, error) {

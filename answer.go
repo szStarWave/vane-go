@@ -40,23 +40,27 @@ func Answer(ctx context.Context, req Request) (<-chan *model.Response, error) {
 		now = time.Now()
 	}
 	agent := SearchAgent{
-		ClassifierModel:       req.Model,
-		ResearchModel:         firstModel(req.ResearchModel, req.Model),
-		SearchProvider:        provider,
-		ScrapeProvider:        req.ScrapeProvider,
-		EmbeddingProvider:     req.EmbeddingProvider,
-		TextEmbeddingProvider: req.TextEmbeddingProvider,
-		WidgetProviders:       req.WidgetProviders,
-		OnSearchEvent:         req.OnSearchEvent,
+		ClassifierModel:         req.Model,
+		ResearchModel:           firstModel(req.ResearchModel, req.Model),
+		SearchProvider:          provider,
+		ScrapeProvider:          req.ScrapeProvider,
+		EmbeddingProvider:       req.EmbeddingProvider,
+		TextEmbeddingProvider:   req.TextEmbeddingProvider,
+		WidgetProviders:         req.WidgetProviders,
+		OnSearchEvent:           req.OnSearchEvent,
+		Concurrency:             req.Concurrency,
+		SoftMaxInformationCalls: req.SoftMaxInformationCalls,
 	}
 	result, err := agent.Run(ctx, SearchAgentRequest{
-		Query:         query,
-		Messages:      req.Messages,
-		Mode:          mode,
-		Sources:       req.Sources,
-		FileIDs:       req.FileIDs,
-		MaxIterations: req.MaxIterations,
-		Now:           now,
+		Query:                   query,
+		Messages:                req.Messages,
+		Mode:                    mode,
+		Sources:                 req.Sources,
+		FileIDs:                 req.FileIDs,
+		MaxIterations:           req.MaxIterations,
+		Concurrency:             req.Concurrency,
+		SoftMaxInformationCalls: req.SoftMaxInformationCalls,
+		Now:                     now,
 	})
 	if err != nil {
 		notifySearchError(req.OnSearchError, err)

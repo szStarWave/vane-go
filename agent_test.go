@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -635,6 +636,76 @@ func TestResearcherStopsAfterRepeatedSearchFailures(t *testing.T) {
 	}
 }
 
+func TestResearcherExecutesSearchQueriesConcurrently(t *testing.T) {
+	searcher := &blockingSearchProvider{gate: make(chan struct{})}
+	researchModel := &scriptedResearchModel{calls: [][]model.ToolCall{
+		{toolCall("search-1", "web_search", map[string]any{"queries": []string{"one", "two", "three"}})},
+		{toolCall("done-1", "done", map[string]any{})},
+	}}
+	researcher := Researcher{
+		ResearchModel:  researchModel,
+		SearchProvider: searcher,
+		Concurrency:    3,
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := researcher.Research(context.Background(), ResearchRequest{
+			Query: "parallel search",
+			Classification: Classification{
+				ShouldSearch:       true,
+				StandaloneFollowUp: "parallel search",
+				Sources:            []SearchSource{SearchSourceWeb},
+			},
+			Mode:    ModeQuality,
+			Sources: []SearchSource{SearchSourceWeb},
+		})
+		done <- err
+	}()
+	deadline := time.After(time.Second)
+	for searcher.activeCount() < 3 {
+		select {
+		case <-deadline:
+			t.Fatalf("active searches = %d, want 3 concurrent searches", searcher.activeCount())
+		default:
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+	close(searcher.gate)
+	if err := <-done; err != nil {
+		t.Fatalf("Research: %v", err)
+	}
+}
+
+func TestResearcherStopsAfterSoftInformationBudget(t *testing.T) {
+	searcher := &manySearchProvider{}
+	researchModel := &scriptedResearchModel{calls: [][]model.ToolCall{
+		{toolCall("search-1", "web_search", map[string]any{"queries": []string{"first angle"}})},
+		{toolCall("search-2", "web_search", map[string]any{"queries": []string{"second angle"}})},
+		{toolCall("search-3", "web_search", map[string]any{"queries": []string{"should not run"}})},
+	}}
+	researcher := Researcher{
+		ResearchModel:  researchModel,
+		SearchProvider: searcher,
+	}
+	_, err := researcher.Research(context.Background(), ResearchRequest{
+		Query: "storm impact",
+		Classification: Classification{
+			ShouldSearch:       true,
+			StandaloneFollowUp: "storm impact",
+			Sources:            []SearchSource{SearchSourceWeb},
+		},
+		Mode:                    ModeQuality,
+		Sources:                 []SearchSource{SearchSourceWeb},
+		SoftMaxInformationCalls: 1,
+	})
+	if err != nil {
+		t.Fatalf("Research: %v", err)
+	}
+	if len(researchModel.requests) != 1 {
+		t.Fatalf("research model requests = %d, want soft budget to stop after first information call", len(researchModel.requests))
+	}
+}
+
 type staticTextModel struct {
 	text string
 }
@@ -689,6 +760,31 @@ func (p *duplicateURLSearchProvider) Search(_ context.Context, query string, opt
 		Content: "snippet from " + query,
 		Source:  opts.Source,
 	}}, nil
+}
+
+type blockingSearchProvider struct {
+	mu     sync.Mutex
+	active int
+	gate   chan struct{}
+}
+
+func (p *blockingSearchProvider) Search(_ context.Context, query string, opts SearchOptions) ([]SearchResult, error) {
+	p.mu.Lock()
+	p.active++
+	p.mu.Unlock()
+	<-p.gate
+	return []SearchResult{{
+		Title:   query,
+		URL:     "https://example.com/" + query,
+		Content: "result for " + query,
+		Source:  opts.Source,
+	}}, nil
+}
+
+func (p *blockingSearchProvider) activeCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.active
 }
 
 func (m *staticTextModel) Info() model.Info { return model.Info{Name: "static"} }

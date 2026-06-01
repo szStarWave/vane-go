@@ -7,6 +7,7 @@ import (
 	"math"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"trpc.group/trpc-go/trpc-agent-go/model"
@@ -64,6 +65,7 @@ func (r Researcher) researchWithTools(ctx context.Context, req ResearchRequest) 
 	var firstErr error
 	usedTools := false
 	failedInfoCalls := 0
+	informationCalls := 0
 	for step := 0; step < iterations; step++ {
 		prompt := getResearcherPrompt(req, step, iterations)
 		ch, err := r.ResearchModel.GenerateContent(ctx, &model.Request{
@@ -93,10 +95,20 @@ func (r Researcher) researchWithTools(ctx context.Context, req ResearchRequest) 
 		}
 		usedTools = true
 		history = append(history, model.Message{Role: model.RoleAssistant, ToolCalls: toolCalls})
-		done := false
-		for _, call := range toolCalls {
+		type callOutcome struct {
+			call         model.ToolCall
+			name         string
+			args         map[string]any
+			actionResult researchActionResult
+			err          error
+		}
+		outcomes := make([]callOutcome, len(toolCalls))
+		var wg sync.WaitGroup
+		sem := make(chan struct{}, effectiveConcurrency(req.Mode, firstPositive(req.Concurrency, r.Concurrency)))
+		for i, call := range toolCalls {
 			name := call.Function.Name
 			args := callArgsMap(call.Function.Arguments)
+			outcomes[i] = callOutcome{call: call, name: name, args: args}
 			emitSearchEvent(ctx, r.OnSearchEvent, SearchEvent{
 				Type:   SearchEventToolCall,
 				Mode:   req.Mode,
@@ -110,7 +122,23 @@ func (r Researcher) researchWithTools(ctx context.Context, req ResearchRequest) 
 					Step: step + 1,
 				},
 			})
-			actionResult, err := r.executeResearchTool(ctx, req, name, call.Function.Arguments, step+1)
+			wg.Add(1)
+			go func(i int, call model.ToolCall, name string) {
+				defer wg.Done()
+				sem <- struct{}{}
+				defer func() { <-sem }()
+				actionResult, err := r.executeResearchTool(ctx, req, name, call.Function.Arguments, step+1)
+				outcomes[i].actionResult = actionResult
+				outcomes[i].err = err
+			}(i, call, name)
+		}
+		wg.Wait()
+		done := false
+		for _, outcome := range outcomes {
+			call := outcome.call
+			name := outcome.name
+			actionResult := outcome.actionResult
+			err := outcome.err
 			if err != nil && firstErr == nil {
 				firstErr = err
 			}
@@ -159,8 +187,12 @@ func (r Researcher) researchWithTools(ctx context.Context, req ResearchRequest) 
 				Results:     actionResult.Results,
 			})
 			if isInformationTool(name) && len(actionResult.Results) == 0 && (err != nil || actionResult.Error != "") {
+				informationCalls++
 				failedInfoCalls++
 			} else if len(actionResult.Results) > 0 {
+				if isInformationTool(name) {
+					informationCalls++
+				}
 				failedInfoCalls = 0
 			}
 			if len(out) > before {
@@ -181,6 +213,9 @@ func (r Researcher) researchWithTools(ctx context.Context, req ResearchRequest) 
 			}
 		}
 		if done || len(out) >= totalResultLimit(req.Mode) {
+			break
+		}
+		if shouldStopAfterSoftInformationBudget(req.Mode, out, informationCalls, firstPositive(req.SoftMaxInformationCalls, r.SoftMaxInformationCalls)) {
 			break
 		}
 		if failedInfoCalls >= maxFailedInformationToolCalls(req.Mode) {
@@ -213,6 +248,27 @@ func maxFailedInformationToolCalls(mode Mode) int {
 	default:
 		return 3
 	}
+}
+
+func shouldStopAfterSoftInformationBudget(mode Mode, results []SearchResult, calls int, budget int) bool {
+	if budget <= 0 || calls < budget {
+		return false
+	}
+	minResults := 4
+	if mode == ModeQuality {
+		minResults = 8
+	}
+	return countCredibleResults(results) >= minResults
+}
+
+func countCredibleResults(results []SearchResult) int {
+	count := 0
+	for _, result := range results {
+		if strings.TrimSpace(result.URL) != "" || strings.TrimSpace(result.Content) != "" {
+			count++
+		}
+	}
+	return count
 }
 
 func (r Researcher) availableResearchTools(req ResearchRequest) map[string]tool.Tool {
@@ -337,18 +393,35 @@ func (r Researcher) executeQueries(ctx context.Context, req ResearchRequest, sou
 	}
 	var all []SearchResult
 	var firstErr error
-	for _, q := range queries {
-		q = resolveRelativeDateQuery(q, req.Now)
-		results, err := r.runAction(ctx, req, source, q)
-		if err != nil && firstErr == nil {
-			firstErr = err
-		}
-		for i := range results {
-			if results[i].Source == "" {
-				results[i].Source = source
+	type queryOutcome struct {
+		results []SearchResult
+		err     error
+	}
+	outcomes := make([]queryOutcome, len(queries))
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, effectiveConcurrency(req.Mode, firstPositive(req.Concurrency, r.Concurrency)))
+	for i, q := range queries {
+		i, q := i, resolveRelativeDateQuery(q, req.Now)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			results, err := r.runAction(ctx, req, source, q)
+			for i := range results {
+				if results[i].Source == "" {
+					results[i].Source = source
+				}
 			}
+			outcomes[i] = queryOutcome{results: results, err: err}
+		}()
+	}
+	wg.Wait()
+	for _, outcome := range outcomes {
+		if outcome.err != nil && firstErr == nil {
+			firstErr = outcome.err
 		}
-		all = append(all, results...)
+		all = append(all, outcome.results...)
 	}
 	all = r.rankAndDedupe(ctx, queries, all, req.Mode)
 	if req.Mode == ModeQuality && source != SearchSourceUploads {
@@ -504,38 +577,35 @@ func (r Researcher) deepReadQuality(ctx context.Context, req ResearchRequest, qu
 	if len(picked) > 3 {
 		picked = picked[:3]
 	}
-	var out []SearchResult
 	pickedKeys := map[string]bool{}
 	for _, result := range picked {
 		if key := canonicalResultKey(result); key != "" {
 			pickedKeys[key] = true
 		}
-		if strings.TrimSpace(result.URL) == "" {
-			result.Stage = "deep_read"
-			out = append(out, result)
+	}
+	outcomes := make([]SearchResult, len(picked))
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, effectiveConcurrency(req.Mode, firstPositive(req.Concurrency, r.Concurrency)))
+	for i, result := range picked {
+		i, result := i, result
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			outcomes[i] = r.deepReadOne(ctx, queries, result)
+		}()
+	}
+	wg.Wait()
+	var out []SearchResult
+	for _, result := range outcomes {
+		if strings.TrimSpace(result.Title) == "" && strings.TrimSpace(result.URL) == "" && strings.TrimSpace(result.Content) == "" {
 			continue
 		}
-		doc, err := r.ScrapeProvider.Scrape(ctx, result.URL)
-		if err != nil || strings.TrimSpace(doc.Content) == "" {
-			result.Stage = "deep_read"
-			out = append(out, result)
+		if !qualityResultRelevant(queries, result) {
 			continue
 		}
-		facts := r.extractFacts(ctx, queries, doc.Content)
-		if strings.TrimSpace(facts) == "" {
-			facts = doc.Content
-		}
-		deepResult := SearchResult{
-			Title:   firstNonEmpty(doc.Title, result.Title),
-			URL:     firstNonEmpty(doc.URL, result.URL),
-			Content: facts,
-			Source:  result.Source,
-			Stage:   "deep_read",
-		}
-		if !qualityResultRelevant(queries, deepResult) {
-			continue
-		}
-		out = append(out, deepResult)
+		out = append(out, result)
 	}
 	if len(out) == 0 {
 		return candidates
@@ -543,6 +613,29 @@ func (r Researcher) deepReadQuality(ctx context.Context, req ResearchRequest, qu
 	supplementalLimit := min(maxQualitySupplementalResults, totalResultLimit(req.Mode)-len(out))
 	out = append(out, supplementalQualityResults(queries, candidates, pickedKeys, supplementalLimit)...)
 	return dedupeResults(out)
+}
+
+func (r Researcher) deepReadOne(ctx context.Context, queries []string, result SearchResult) SearchResult {
+	if strings.TrimSpace(result.URL) == "" {
+		result.Stage = "deep_read"
+		return result
+	}
+	doc, err := r.ScrapeProvider.Scrape(ctx, result.URL)
+	if err != nil || strings.TrimSpace(doc.Content) == "" {
+		result.Stage = "deep_read"
+		return result
+	}
+	facts := r.extractFacts(ctx, queries, doc.Content)
+	if strings.TrimSpace(facts) == "" {
+		facts = doc.Content
+	}
+	return SearchResult{
+		Title:   firstNonEmpty(doc.Title, result.Title),
+		URL:     firstNonEmpty(doc.URL, result.URL),
+		Content: facts,
+		Source:  result.Source,
+		Stage:   "deep_read",
+	}
 }
 
 const maxQualitySupplementalResults = 8
@@ -750,31 +843,41 @@ func (r Researcher) extractFacts(ctx context.Context, queries []string, content 
 	if r.ResearchModel == nil {
 		return content
 	}
-	var out strings.Builder
-	for _, chunk := range splitText(content, 4000, 500) {
-		ch, err := r.ResearchModel.GenerateContent(ctx, &model.Request{
-			Messages: []model.Message{
-				model.NewSystemMessage("You are Vane's information extractor. Return compact JSON only: {\"extracted_facts\":\"- Fact\"}. Extract only facts relevant to the queries, preserve raw numbers and table values, remove boilerplate."),
-				model.NewUserMessage(fmt.Sprintf("<queries>%s</queries>\n<scraped_data>%s</scraped_data>", strings.Join(queries, ", "), chunk)),
-			},
-			GenerationConfig: model.GenerationConfig{Stream: false, Temperature: floatPtr(0), MaxTokens: intPtr(900)},
-		})
-		if err != nil {
-			continue
-		}
-		text, err := collectResponseText(ctx, ch)
-		if err != nil {
-			continue
-		}
-		var parsed struct {
-			ExtractedFacts string `json:"extracted_facts"`
-		}
-		if err := json.Unmarshal([]byte(extractJSONObject(text)), &parsed); err == nil && strings.TrimSpace(parsed.ExtractedFacts) != "" {
-			out.WriteString(parsed.ExtractedFacts)
-			out.WriteString("\n")
-		}
+	chunks := splitText(content, 4000, 500)
+	out := make([]string, len(chunks))
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, effectiveConcurrency(ModeQuality, r.Concurrency))
+	for i, chunk := range chunks {
+		i, chunk := i, chunk
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			ch, err := r.ResearchModel.GenerateContent(ctx, &model.Request{
+				Messages: []model.Message{
+					model.NewSystemMessage("You are Vane's information extractor. Return compact JSON only: {\"extracted_facts\":\"- Fact\"}. Extract only facts relevant to the queries, preserve raw numbers and table values, remove boilerplate."),
+					model.NewUserMessage(fmt.Sprintf("<queries>%s</queries>\n<scraped_data>%s</scraped_data>", strings.Join(queries, ", "), chunk)),
+				},
+				GenerationConfig: model.GenerationConfig{Stream: false, Temperature: floatPtr(0), MaxTokens: intPtr(900)},
+			})
+			if err != nil {
+				return
+			}
+			text, err := collectResponseText(ctx, ch)
+			if err != nil {
+				return
+			}
+			var parsed struct {
+				ExtractedFacts string `json:"extracted_facts"`
+			}
+			if err := json.Unmarshal([]byte(extractJSONObject(text)), &parsed); err == nil && strings.TrimSpace(parsed.ExtractedFacts) != "" {
+				out[i] = strings.TrimSpace(parsed.ExtractedFacts)
+			}
+		}()
 	}
-	return strings.TrimSpace(out.String())
+	wg.Wait()
+	return strings.TrimSpace(strings.Join(nonEmptyStrings(out), "\n"))
 }
 
 func (r Researcher) scrapeURLs(ctx context.Context, req ResearchRequest, urls []string) (researchActionResult, error) {
@@ -786,22 +889,32 @@ func (r Researcher) scrapeURLs(ctx context.Context, req ResearchRequest, urls []
 	if len(urls) > 3 {
 		urls = urls[:3]
 	}
-	var results []SearchResult
-	for _, rawURL := range urls {
-		doc, err := r.ScrapeProvider.Scrape(ctx, rawURL)
-		if err != nil {
-			results = append(results, SearchResult{Title: "Error scraping " + rawURL, URL: rawURL, Content: err.Error()})
-			continue
-		}
-		content := doc.Content
-		if req.Mode == ModeQuality {
-			if facts := r.extractFacts(ctx, []string{req.Query}, doc.Content); facts != "" {
-				content = facts
+	results := make([]SearchResult, len(urls))
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, effectiveConcurrency(req.Mode, firstPositive(req.Concurrency, r.Concurrency)))
+	for i, rawURL := range urls {
+		i, rawURL := i, rawURL
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			doc, err := r.ScrapeProvider.Scrape(ctx, rawURL)
+			if err != nil {
+				results[i] = SearchResult{Title: "Error scraping " + rawURL, URL: rawURL, Content: err.Error()}
+				return
 			}
-		}
-		results = append(results, SearchResult{Title: firstNonEmpty(doc.Title, rawURL), URL: firstNonEmpty(doc.URL, rawURL), Content: content})
+			content := doc.Content
+			if req.Mode == ModeQuality {
+				if facts := r.extractFacts(ctx, []string{req.Query}, doc.Content); facts != "" {
+					content = facts
+				}
+			}
+			results[i] = SearchResult{Title: firstNonEmpty(doc.Title, rawURL), URL: firstNonEmpty(doc.URL, rawURL), Content: content}
+		}()
 	}
-	return researchActionResult{Type: "search_results", Results: results}, nil
+	wg.Wait()
+	return researchActionResult{Type: "search_results", Results: compactResults(results)}, nil
 }
 
 func getResearcherPrompt(req ResearchRequest, i, maxIteration int) string {
@@ -975,6 +1088,61 @@ func collectToolCalls(ctx context.Context, ch <-chan *model.Response) ([]model.T
 			}
 		}
 	}
+}
+
+func effectiveConcurrency(mode Mode, configured int) int {
+	if configured > 0 {
+		return clampInt(configured, 1, 12)
+	}
+	switch mode {
+	case ModeSpeed:
+		return 2
+	case ModeQuality:
+		return 4
+	default:
+		return 3
+	}
+}
+
+func firstPositive(values ...int) int {
+	for _, value := range values {
+		if value > 0 {
+			return value
+		}
+	}
+	return 0
+}
+
+func clampInt(value, minValue, maxValue int) int {
+	if value < minValue {
+		return minValue
+	}
+	if value > maxValue {
+		return maxValue
+	}
+	return value
+}
+
+func nonEmptyStrings(values []string) []string {
+	out := values[:0]
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value != "" {
+			out = append(out, value)
+		}
+	}
+	return out
+}
+
+func compactResults(results []SearchResult) []SearchResult {
+	out := results[:0]
+	for _, result := range results {
+		if strings.TrimSpace(result.Title) == "" && strings.TrimSpace(result.URL) == "" && strings.TrimSpace(result.Content) == "" {
+			continue
+		}
+		out = append(out, result)
+	}
+	return out
 }
 
 func formatMessagesForPrompt(messages []model.Message) string {

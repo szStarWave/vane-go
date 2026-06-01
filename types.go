@@ -28,25 +28,27 @@ func NormalizeMode(value string) Mode {
 }
 
 type Request struct {
-	Model                 model.Model
-	ResearchModel         model.Model
-	ModelInfo             ModelInfo
-	Messages              []model.Message
-	GenerationConfig      model.GenerationConfig
-	ExtraFields           map[string]any
-	Mode                  Mode
-	SystemInstructions    string
-	SearchProvider        SearchProvider
-	ScrapeProvider        ScrapeProvider
-	Sources               []SearchSource
-	FileIDs               []string
-	EmbeddingProvider     EmbeddingProvider
-	TextEmbeddingProvider TextEmbeddingProvider
-	WidgetProviders       WidgetProviders
-	MaxIterations         int
-	OnSearchError         func(error)
-	OnSearchEvent         func(context.Context, SearchEvent)
-	Now                   time.Time
+	Model                   model.Model
+	ResearchModel           model.Model
+	ModelInfo               ModelInfo
+	Messages                []model.Message
+	GenerationConfig        model.GenerationConfig
+	ExtraFields             map[string]any
+	Mode                    Mode
+	SystemInstructions      string
+	SearchProvider          SearchProvider
+	ScrapeProvider          ScrapeProvider
+	Sources                 []SearchSource
+	FileIDs                 []string
+	EmbeddingProvider       EmbeddingProvider
+	TextEmbeddingProvider   TextEmbeddingProvider
+	WidgetProviders         WidgetProviders
+	MaxIterations           int
+	Concurrency             int
+	SoftMaxInformationCalls int
+	OnSearchError           func(error)
+	OnSearchEvent           func(context.Context, SearchEvent)
+	Now                     time.Time
 }
 
 type SearchOptions struct {
@@ -119,21 +121,23 @@ type SearchProvider interface {
 }
 
 type AnsweringModel struct {
-	Base                  model.Model
-	ResearchModel         model.Model
-	ModelInfo             ModelInfo
-	Mode                  Mode
-	SearchProvider        SearchProvider
-	ScrapeProvider        ScrapeProvider
-	Sources               []SearchSource
-	FileIDs               []string
-	EmbeddingProvider     EmbeddingProvider
-	TextEmbeddingProvider TextEmbeddingProvider
-	WidgetProviders       WidgetProviders
-	MaxIterations         int
-	SystemInstructions    string
-	OnSearchError         func(error)
-	OnSearchEvent         func(context.Context, SearchEvent)
+	Base                    model.Model
+	ResearchModel           model.Model
+	ModelInfo               ModelInfo
+	Mode                    Mode
+	SearchProvider          SearchProvider
+	ScrapeProvider          ScrapeProvider
+	Sources                 []SearchSource
+	FileIDs                 []string
+	EmbeddingProvider       EmbeddingProvider
+	TextEmbeddingProvider   TextEmbeddingProvider
+	WidgetProviders         WidgetProviders
+	MaxIterations           int
+	Concurrency             int
+	SoftMaxInformationCalls int
+	SystemInstructions      string
+	OnSearchError           func(error)
+	OnSearchEvent           func(context.Context, SearchEvent)
 }
 
 type SearchSource string
