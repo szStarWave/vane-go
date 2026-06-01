@@ -36,11 +36,14 @@ func Answer(ctx context.Context, req Request) (<-chan *model.Response, error) {
 		mode = ModeBalanced
 	}
 	agent := SearchAgent{
-		ClassifierModel:   req.Model,
-		SearchProvider:    provider,
-		EmbeddingProvider: req.EmbeddingProvider,
-		WidgetProviders:   req.WidgetProviders,
-		OnSearchEvent:     req.OnSearchEvent,
+		ClassifierModel:       req.Model,
+		ResearchModel:         firstModel(req.ResearchModel, req.Model),
+		SearchProvider:        provider,
+		ScrapeProvider:        req.ScrapeProvider,
+		EmbeddingProvider:     req.EmbeddingProvider,
+		TextEmbeddingProvider: req.TextEmbeddingProvider,
+		WidgetProviders:       req.WidgetProviders,
+		OnSearchEvent:         req.OnSearchEvent,
 	}
 	result, err := agent.Run(ctx, SearchAgentRequest{
 		Query:         query,

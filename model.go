@@ -29,24 +29,34 @@ func (m *AnsweringModel) GenerateContent(ctx context.Context, request *model.Req
 		mode = ModeBalanced
 	}
 	return Answer(ctx, Request{
-		Model:              m.Base,
-		ModelInfo:          m.ModelInfo,
-		Messages:           request.Messages,
-		GenerationConfig:   request.GenerationConfig,
-		ExtraFields:        request.ExtraFields,
-		Mode:               mode,
-		SystemInstructions: m.SystemInstructions,
-		SearchProvider:     m.SearchProvider,
-		Sources:            m.Sources,
-		FileIDs:            m.FileIDs,
-		EmbeddingProvider:  m.EmbeddingProvider,
-		WidgetProviders:    m.WidgetProviders,
-		MaxIterations:      m.MaxIterations,
-		OnSearchError:      m.OnSearchError,
-		OnSearchEvent:      m.OnSearchEvent,
+		Model:                 m.Base,
+		ResearchModel:         firstModel(m.ResearchModel, m.Base),
+		ModelInfo:             m.ModelInfo,
+		Messages:              request.Messages,
+		GenerationConfig:      request.GenerationConfig,
+		ExtraFields:           request.ExtraFields,
+		Mode:                  mode,
+		SystemInstructions:    m.SystemInstructions,
+		SearchProvider:        m.SearchProvider,
+		ScrapeProvider:        m.ScrapeProvider,
+		Sources:               m.Sources,
+		FileIDs:               m.FileIDs,
+		EmbeddingProvider:     m.EmbeddingProvider,
+		TextEmbeddingProvider: m.TextEmbeddingProvider,
+		WidgetProviders:       m.WidgetProviders,
+		MaxIterations:         m.MaxIterations,
+		OnSearchError:         m.OnSearchError,
+		OnSearchEvent:         m.OnSearchEvent,
 	})
 }
 
 type modelErr string
 
 func (e modelErr) Error() string { return string(e) }
+
+func firstModel(primary, fallback model.Model) model.Model {
+	if primary != nil {
+		return primary
+	}
+	return fallback
+}

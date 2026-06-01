@@ -2,6 +2,7 @@ package vane
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -193,6 +194,41 @@ func TestLLMClassifierAddsAcademicAndDiscussionSources(t *testing.T) {
 	}
 }
 
+func TestVaneStyleClassifierOutputAddsSourcesAndStandaloneFollowUp(t *testing.T) {
+	classifier := &staticTextModel{text: `{
+		"classification": {
+			"skipSearch": false,
+			"personalSearch": false,
+			"academicSearch": true,
+			"discussionSearch": true,
+			"showWeatherWidget": false,
+			"showStockWidget": false,
+			"showCalculationWidget": false
+		},
+		"standaloneFollowUp": "Compare agent framework benchmarks and community feedback"
+	}`}
+	agent := SearchAgent{ClassifierModel: classifier}
+	got := agent.classify(context.Background(), SearchAgentRequest{
+		Query: "那它们 benchmark 和用户反馈呢",
+		Messages: []model.Message{
+			model.NewUserMessage("LangGraph AutoGen CrewAI 对比"),
+			model.NewAssistantMessage("可以从架构和生态比较。"),
+			model.NewUserMessage("那它们 benchmark 和用户反馈呢"),
+		},
+		Mode:    ModeBalanced,
+		Sources: []SearchSource{SearchSourceWeb},
+	})
+	if got.SkipSearch || !got.ShouldSearch {
+		t.Fatalf("classification search flags = %#v, want search", got)
+	}
+	if got.StandaloneFollowUp != "Compare agent framework benchmarks and community feedback" {
+		t.Fatalf("StandaloneFollowUp = %q", got.StandaloneFollowUp)
+	}
+	if !hasSource(got.Sources, SearchSourceAcademic) || !hasSource(got.Sources, SearchSourceDiscussions) {
+		t.Fatalf("sources = %#v, want academic and discussions", got.Sources)
+	}
+}
+
 func TestLLMClassifierFallsBackOnInvalidJSON(t *testing.T) {
 	agent := SearchAgent{ClassifierModel: &staticTextModel{text: "not json"}}
 	got := agent.classify(context.Background(), SearchAgentRequest{
@@ -201,6 +237,79 @@ func TestLLMClassifierFallsBackOnInvalidJSON(t *testing.T) {
 	})
 	if got.ShouldSearch {
 		t.Fatalf("ShouldSearch = true, want heuristic conversational fallback")
+	}
+}
+
+func TestResearcherUsesNativeToolCallLoop(t *testing.T) {
+	searcher := &recordingSearchProvider{}
+	researchModel := &scriptedResearchModel{calls: [][]model.ToolCall{
+		{
+			toolCall("plan-1", "__reasoning_preamble", map[string]any{"plan": "Looking into the current facts."}),
+			toolCall("search-1", "web_search", map[string]any{"queries": []string{"vane search agent"}}),
+		},
+		{
+			toolCall("done-1", "done", map[string]any{}),
+		},
+	}}
+	var events []SearchEvent
+	researcher := Researcher{
+		ResearchModel:  researchModel,
+		SearchProvider: searcher,
+		OnSearchEvent: func(_ context.Context, ev SearchEvent) {
+			events = append(events, ev)
+		},
+	}
+	results, err := researcher.Research(context.Background(), ResearchRequest{
+		Query: "what is vane",
+		Classification: Classification{
+			ShouldSearch:       true,
+			StandaloneFollowUp: "what is vane",
+			Sources:            []SearchSource{SearchSourceWeb},
+		},
+		Mode:    ModeBalanced,
+		Sources: []SearchSource{SearchSourceWeb},
+	})
+	if err != nil {
+		t.Fatalf("Research: %v", err)
+	}
+	if len(results) == 0 || len(searcher.queries) != 1 || searcher.queries[0] != "vane search agent" {
+		t.Fatalf("results=%#v queries=%#v, want one model-selected search", results, searcher.queries)
+	}
+	if !hasEventType(events, SearchEventResearchStep) || !hasEventType(events, SearchEventToolCall) || !hasEventType(events, SearchEventToolResult) {
+		t.Fatalf("events missing tool-loop events: %#v", events)
+	}
+	if len(researchModel.requests) < 2 || len(researchModel.requests[0].Tools) == 0 {
+		t.Fatalf("research model did not receive tools: %#v", researchModel.requests)
+	}
+}
+
+func TestQualityResearchScrapesAndExtractsFacts(t *testing.T) {
+	searcher := &recordingSearchProvider{}
+	researchModel := &scriptedResearchModel{calls: [][]model.ToolCall{
+		{toolCall("search-1", "web_search", map[string]any{"queries": []string{"Harbin tornado official report"}})},
+		{toolCall("done-1", "done", map[string]any{})},
+	}}
+	researcher := Researcher{
+		ResearchModel:  researchModel,
+		SearchProvider: searcher,
+		ScrapeProvider: staticScrapeProvider{content: "Long article: tornado caused power outage and traffic disruption."},
+		OnSearchEvent:  func(context.Context, SearchEvent) {},
+	}
+	results, err := researcher.Research(context.Background(), ResearchRequest{
+		Query: "Harbin tornado impacts",
+		Classification: Classification{
+			ShouldSearch:       true,
+			StandaloneFollowUp: "Harbin tornado impacts",
+			Sources:            []SearchSource{SearchSourceWeb},
+		},
+		Mode:    ModeQuality,
+		Sources: []SearchSource{SearchSourceWeb},
+	})
+	if err != nil {
+		t.Fatalf("Research: %v", err)
+	}
+	if len(results) == 0 || !strings.Contains(results[0].Content, "Extracted tornado fact") {
+		t.Fatalf("quality results = %#v, want extracted facts", results)
 	}
 }
 
@@ -244,4 +353,63 @@ func (m *staticTextModel) GenerateContent(_ context.Context, req *model.Request)
 	}
 	close(out)
 	return out, nil
+}
+
+type scriptedResearchModel struct {
+	calls    [][]model.ToolCall
+	requests []*model.Request
+}
+
+func (m *scriptedResearchModel) Info() model.Info { return model.Info{Name: "scripted-research"} }
+
+func (m *scriptedResearchModel) GenerateContent(_ context.Context, req *model.Request) (<-chan *model.Response, error) {
+	m.requests = append(m.requests, req)
+	out := make(chan *model.Response, 1)
+	system := ""
+	if req != nil && len(req.Messages) > 0 {
+		system = req.Messages[0].Content
+	}
+	content := ""
+	var toolCalls []model.ToolCall
+	switch {
+	case strings.Contains(system, "search result picker"):
+		content = `{"picked_indices":[0]}`
+	case strings.Contains(system, "information extractor"):
+		content = `{"extracted_facts":"- Extracted tornado fact: outage and traffic disruption."}`
+	default:
+		if len(m.calls) > 0 {
+			toolCalls = m.calls[0]
+			m.calls = m.calls[1:]
+		}
+	}
+	out <- &model.Response{
+		Object:    model.ObjectTypeChatCompletion,
+		Timestamp: time.Now(),
+		Done:      true,
+		Choices: []model.Choice{{
+			Message: model.Message{Role: model.RoleAssistant, Content: content, ToolCalls: toolCalls},
+		}},
+	}
+	close(out)
+	return out, nil
+}
+
+func toolCall(id, name string, args map[string]any) model.ToolCall {
+	payload, _ := json.Marshal(args)
+	return model.ToolCall{
+		ID:   id,
+		Type: "function",
+		Function: model.FunctionDefinitionParam{
+			Name:      name,
+			Arguments: payload,
+		},
+	}
+}
+
+type staticScrapeProvider struct {
+	content string
+}
+
+func (p staticScrapeProvider) Scrape(_ context.Context, rawURL string) (ScrapedDocument, error) {
+	return ScrapedDocument{URL: rawURL, Title: "Scraped", Content: p.content}, nil
 }

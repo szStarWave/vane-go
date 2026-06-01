@@ -28,22 +28,25 @@ func NormalizeMode(value string) Mode {
 }
 
 type Request struct {
-	Model              model.Model
-	ModelInfo          ModelInfo
-	Messages           []model.Message
-	GenerationConfig   model.GenerationConfig
-	ExtraFields        map[string]any
-	Mode               Mode
-	SystemInstructions string
-	SearchProvider     SearchProvider
-	Sources            []SearchSource
-	FileIDs            []string
-	EmbeddingProvider  EmbeddingProvider
-	WidgetProviders    WidgetProviders
-	MaxIterations      int
-	OnSearchError      func(error)
-	OnSearchEvent      func(context.Context, SearchEvent)
-	Now                time.Time
+	Model                 model.Model
+	ResearchModel         model.Model
+	ModelInfo             ModelInfo
+	Messages              []model.Message
+	GenerationConfig      model.GenerationConfig
+	ExtraFields           map[string]any
+	Mode                  Mode
+	SystemInstructions    string
+	SearchProvider        SearchProvider
+	ScrapeProvider        ScrapeProvider
+	Sources               []SearchSource
+	FileIDs               []string
+	EmbeddingProvider     EmbeddingProvider
+	TextEmbeddingProvider TextEmbeddingProvider
+	WidgetProviders       WidgetProviders
+	MaxIterations         int
+	OnSearchError         func(error)
+	OnSearchEvent         func(context.Context, SearchEvent)
+	Now                   time.Time
 }
 
 type SearchOptions struct {
@@ -115,18 +118,21 @@ type SearchProvider interface {
 }
 
 type AnsweringModel struct {
-	Base               model.Model
-	ModelInfo          ModelInfo
-	Mode               Mode
-	SearchProvider     SearchProvider
-	Sources            []SearchSource
-	FileIDs            []string
-	EmbeddingProvider  EmbeddingProvider
-	WidgetProviders    WidgetProviders
-	MaxIterations      int
-	SystemInstructions string
-	OnSearchError      func(error)
-	OnSearchEvent      func(context.Context, SearchEvent)
+	Base                  model.Model
+	ResearchModel         model.Model
+	ModelInfo             ModelInfo
+	Mode                  Mode
+	SearchProvider        SearchProvider
+	ScrapeProvider        ScrapeProvider
+	Sources               []SearchSource
+	FileIDs               []string
+	EmbeddingProvider     EmbeddingProvider
+	TextEmbeddingProvider TextEmbeddingProvider
+	WidgetProviders       WidgetProviders
+	MaxIterations         int
+	SystemInstructions    string
+	OnSearchError         func(error)
+	OnSearchEvent         func(context.Context, SearchEvent)
 }
 
 type SearchSource string
@@ -139,15 +145,20 @@ const (
 )
 
 type Classification struct {
-	ShouldSearch bool           `json:"should_search"`
-	Intent       string         `json:"intent,omitempty"`
-	Reason       string         `json:"reason,omitempty"`
-	Sources      []SearchSource `json:"sources,omitempty"`
-	NeedWeather  bool           `json:"need_weather,omitempty"`
-	NeedStock    bool           `json:"need_stock,omitempty"`
-	NeedCalc     bool           `json:"need_calc,omitempty"`
-	NeedUploads  bool           `json:"need_uploads,omitempty"`
-	SkipReason   string         `json:"skip_reason,omitempty"`
+	ShouldSearch       bool           `json:"should_search"`
+	SkipSearch         bool           `json:"skipSearch,omitempty"`
+	StandaloneFollowUp string         `json:"standaloneFollowUp,omitempty"`
+	Intent             string         `json:"intent,omitempty"`
+	Reason             string         `json:"reason,omitempty"`
+	Sources            []SearchSource `json:"sources,omitempty"`
+	PersonalSearch     bool           `json:"personalSearch,omitempty"`
+	AcademicSearch     bool           `json:"academicSearch,omitempty"`
+	DiscussionSearch   bool           `json:"discussionSearch,omitempty"`
+	NeedWeather        bool           `json:"need_weather,omitempty"`
+	NeedStock          bool           `json:"need_stock,omitempty"`
+	NeedCalc           bool           `json:"need_calc,omitempty"`
+	NeedUploads        bool           `json:"need_uploads,omitempty"`
+	SkipReason         string         `json:"skip_reason,omitempty"`
 }
 
 type ToolCallEvent struct {
@@ -204,4 +215,18 @@ type WidgetProvider interface {
 
 type EmbeddingProvider interface {
 	SearchUploads(ctx context.Context, query string, fileIDs []string, limit int) ([]SearchResult, error)
+}
+
+type TextEmbeddingProvider interface {
+	EmbedTexts(ctx context.Context, texts []string) ([][]float64, error)
+}
+
+type ScrapedDocument struct {
+	URL     string `json:"url,omitempty"`
+	Title   string `json:"title,omitempty"`
+	Content string `json:"content,omitempty"`
+}
+
+type ScrapeProvider interface {
+	Scrape(ctx context.Context, url string) (ScrapedDocument, error)
 }

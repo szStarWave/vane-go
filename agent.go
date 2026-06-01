@@ -13,11 +13,14 @@ import (
 )
 
 type SearchAgent struct {
-	ClassifierModel   model.Model
-	SearchProvider    SearchProvider
-	EmbeddingProvider EmbeddingProvider
-	WidgetProviders   WidgetProviders
-	OnSearchEvent     func(context.Context, SearchEvent)
+	ClassifierModel       model.Model
+	ResearchModel         model.Model
+	SearchProvider        SearchProvider
+	ScrapeProvider        ScrapeProvider
+	EmbeddingProvider     EmbeddingProvider
+	TextEmbeddingProvider TextEmbeddingProvider
+	WidgetProviders       WidgetProviders
+	OnSearchEvent         func(context.Context, SearchEvent)
 }
 
 type SearchAgentRequest struct {
@@ -63,17 +66,22 @@ func (a SearchAgent) Run(ctx context.Context, req SearchAgentRequest) (SearchAge
 		return SearchAgentResult{Classification: classification, Widgets: widgets}, nil
 	}
 	researcher := Researcher{
-		SearchProvider:    a.SearchProvider,
-		EmbeddingProvider: a.EmbeddingProvider,
-		OnSearchEvent:     a.OnSearchEvent,
+		ResearchModel:         firstModel(a.ResearchModel, a.ClassifierModel),
+		SearchProvider:        a.SearchProvider,
+		ScrapeProvider:        a.ScrapeProvider,
+		EmbeddingProvider:     a.EmbeddingProvider,
+		TextEmbeddingProvider: a.TextEmbeddingProvider,
+		OnSearchEvent:         a.OnSearchEvent,
 	}
 	sources, err := researcher.Research(ctx, ResearchRequest{
-		Query:         req.Query,
-		Mode:          mode,
-		Sources:       classification.Sources,
-		FileIDs:       req.FileIDs,
-		MaxIterations: req.MaxIterations,
-		Now:           req.Now,
+		Query:          req.Query,
+		Messages:       req.Messages,
+		Classification: classification,
+		Mode:           mode,
+		Sources:        classification.Sources,
+		FileIDs:        req.FileIDs,
+		MaxIterations:  req.MaxIterations,
+		Now:            req.Now,
 	})
 	emitSearchEvent(ctx, a.OnSearchEvent, SearchEvent{
 		Type:        SearchEventSourceBlock,
@@ -142,26 +150,30 @@ func classifierSystemPrompt() string {
 
 Schema:
 {
-  "should_search": boolean,
-  "intent": string,
-  "reason": string,
-  "sources": ["web" | "discussions" | "academic"],
-  "need_weather": boolean,
-  "need_stock": boolean,
-  "need_calc": boolean
+  "classification": {
+    "skipSearch": boolean,
+    "personalSearch": boolean,
+    "academicSearch": boolean,
+    "discussionSearch": boolean,
+    "showWeatherWidget": boolean,
+    "showStockWidget": boolean,
+    "showCalculationWidget": boolean
+  },
+  "standaloneFollowUp": string
 }
 
 Rules:
-- Always include "web" when should_search is true.
-- Add "academic" for papers, benchmarks, studies, research evidence, official reports, scientific/medical/policy/technical evaluation questions.
-- Add "discussions" for community feedback, real user experience, bugs, issues, complaints, Reddit/HN/forum/GitHub issue style questions.
-- Do not include uploads; file search is controlled outside this classifier.
-- For casual greetings or pure chat, set should_search=false.
-- For arithmetic, set need_calc=true.`
+- Set skipSearch=false if external, current, factual, academic, discussion, or file-backed search can improve the answer.
+- Set skipSearch=true for casual greetings, pure chat, or questions fully answerable without external sources.
+- Set academicSearch=true for papers, benchmarks, studies, research evidence, official reports, scientific/medical/policy/technical evaluation questions.
+- Set discussionSearch=true for community feedback, real user experience, bugs, issues, complaints, Reddit/HN/forum/GitHub issue style questions.
+- Set personalSearch=true only when uploaded files/personal documents are relevant.
+- Set widget flags when weather, stock, or calculation widgets can help.
+- standaloneFollowUp must be self-contained and context-independent.`
 }
 
 func classifierUserPrompt(req SearchAgentRequest) string {
-	return fmt.Sprintf("Mode: %s\nEnabled baseline sources: %s\nLatest user query:\n%s", req.Mode, joinSources(normalizeSources(req.Sources, req.FileIDs)), strings.TrimSpace(req.Query))
+	return fmt.Sprintf("Mode: %s\nEnabled baseline sources: %s\nConversation history:\n%s\n\nLatest user query:\n%s", req.Mode, joinSources(normalizeSources(req.Sources, req.FileIDs)), formatMessagesForPrompt(req.Messages), strings.TrimSpace(req.Query))
 }
 
 func joinSources(sources []SearchSource) string {
@@ -173,13 +185,24 @@ func joinSources(sources []SearchSource) string {
 }
 
 type classifierJSON struct {
-	ShouldSearch *bool          `json:"should_search"`
-	Intent       string         `json:"intent"`
-	Reason       string         `json:"reason"`
-	Sources      []SearchSource `json:"sources"`
-	NeedWeather  *bool          `json:"need_weather"`
-	NeedStock    *bool          `json:"need_stock"`
-	NeedCalc     *bool          `json:"need_calc"`
+	Classification *struct {
+		SkipSearch            *bool `json:"skipSearch"`
+		PersonalSearch        *bool `json:"personalSearch"`
+		AcademicSearch        *bool `json:"academicSearch"`
+		DiscussionSearch      *bool `json:"discussionSearch"`
+		ShowWeatherWidget     *bool `json:"showWeatherWidget"`
+		ShowStockWidget       *bool `json:"showStockWidget"`
+		ShowCalculationWidget *bool `json:"showCalculationWidget"`
+	} `json:"classification"`
+	StandaloneFollowUp string         `json:"standaloneFollowUp"`
+	ShouldSearch       *bool          `json:"should_search"`
+	SkipSearch         *bool          `json:"skipSearch"`
+	Intent             string         `json:"intent"`
+	Reason             string         `json:"reason"`
+	Sources            []SearchSource `json:"sources"`
+	NeedWeather        *bool          `json:"need_weather"`
+	NeedStock          *bool          `json:"need_stock"`
+	NeedCalc           *bool          `json:"need_calc"`
 }
 
 func parseClassifierJSON(text string, req SearchAgentRequest, fallback Classification) (Classification, error) {
@@ -195,8 +218,38 @@ func parseClassifierJSON(text string, req SearchAgentRequest, fallback Classific
 		return Classification{}, err
 	}
 	out := fallback
+	if parsed.Classification != nil {
+		c := parsed.Classification
+		if c.SkipSearch != nil {
+			out.SkipSearch = *c.SkipSearch
+			out.ShouldSearch = !*c.SkipSearch
+		}
+		if c.PersonalSearch != nil {
+			out.PersonalSearch = *c.PersonalSearch
+		}
+		if c.AcademicSearch != nil {
+			out.AcademicSearch = *c.AcademicSearch
+		}
+		if c.DiscussionSearch != nil {
+			out.DiscussionSearch = *c.DiscussionSearch
+		}
+		if c.ShowWeatherWidget != nil {
+			out.NeedWeather = *c.ShowWeatherWidget
+		}
+		if c.ShowStockWidget != nil {
+			out.NeedStock = *c.ShowStockWidget
+		}
+		if c.ShowCalculationWidget != nil {
+			out.NeedCalc = *c.ShowCalculationWidget
+		}
+	}
 	if parsed.ShouldSearch != nil {
 		out.ShouldSearch = *parsed.ShouldSearch
+		out.SkipSearch = !*parsed.ShouldSearch
+	}
+	if parsed.SkipSearch != nil {
+		out.SkipSearch = *parsed.SkipSearch
+		out.ShouldSearch = !*parsed.SkipSearch
 	}
 	if strings.TrimSpace(parsed.Intent) != "" {
 		out.Intent = strings.TrimSpace(parsed.Intent)
@@ -213,9 +266,19 @@ func parseClassifierJSON(text string, req SearchAgentRequest, fallback Classific
 	if parsed.NeedCalc != nil {
 		out.NeedCalc = *parsed.NeedCalc
 	}
+	if strings.TrimSpace(parsed.StandaloneFollowUp) != "" {
+		out.StandaloneFollowUp = strings.TrimSpace(parsed.StandaloneFollowUp)
+	}
 	if out.ShouldSearch {
-		out.Sources = classifierSources(req, parsed.Sources)
+		modelSources := append([]SearchSource{}, parsed.Sources...)
+		if out.AcademicSearch {
+			modelSources = append(modelSources, SearchSourceAcademic)
+		}
+		if out.DiscussionSearch {
+			modelSources = append(modelSources, SearchSourceDiscussions)
+		}
 		out.SkipReason = ""
+		out.Sources = classifierSources(req, modelSources)
 	} else if out.SkipReason == "" {
 		out.SkipReason = "model classified as no-search"
 	}
@@ -276,18 +339,22 @@ func classifySearch(req SearchAgentRequest) Classification {
 	lower := strings.ToLower(query)
 	sources := normalizeSources(req.Sources, req.FileIDs)
 	classification := Classification{
-		ShouldSearch: true,
-		Intent:       "web_research",
-		Reason:       "The user enabled Vane search, so Vane will gather sources before answering.",
-		Sources:      sources,
+		ShouldSearch:       true,
+		SkipSearch:         false,
+		StandaloneFollowUp: query,
+		Intent:             "web_research",
+		Reason:             "The user enabled Vane search, so Vane will gather sources before answering.",
+		Sources:            sources,
 	}
 	if query == "" {
 		classification.ShouldSearch = false
+		classification.SkipSearch = true
 		classification.SkipReason = "empty query"
 		return classification
 	}
 	if looksConversational(lower) {
 		classification.ShouldSearch = false
+		classification.SkipSearch = true
 		classification.Intent = "conversation"
 		classification.SkipReason = "conversational query"
 		classification.Reason = "The latest user message does not need external sources."
@@ -296,6 +363,9 @@ func classifySearch(req SearchAgentRequest) Classification {
 	classification.NeedStock = containsAny(lower, "stock", "share price", "ticker", "nasdaq", "nyse", "股票", "股价", "行情")
 	classification.NeedCalc = looksLikeCalculation(lower)
 	classification.NeedUploads = len(req.FileIDs) > 0
+	classification.PersonalSearch = classification.NeedUploads
+	classification.AcademicSearch = containsAny(lower, "paper", "study", "research", "benchmark", "arxiv", "pubmed", "\u8bba\u6587", "\u7814\u7a76", "\u5b66\u672f", "\u62a5\u544a")
+	classification.DiscussionSearch = containsAny(lower, "reddit", "hacker news", "forum", "github issue", "community", "discussion", "\u8bba\u575b", "\u793e\u533a", "\u8bc4\u4ef7", "\u5410\u69fd")
 	if classification.NeedWeather {
 		classification.Intent = "weather"
 	}
@@ -308,6 +378,13 @@ func classifySearch(req SearchAgentRequest) Classification {
 	if classification.NeedUploads && !hasSource(classification.Sources, SearchSourceUploads) {
 		classification.Sources = append(classification.Sources, SearchSourceUploads)
 	}
+	if classification.AcademicSearch && !hasSource(classification.Sources, SearchSourceAcademic) {
+		classification.Sources = append(classification.Sources, SearchSourceAcademic)
+	}
+	if classification.DiscussionSearch && !hasSource(classification.Sources, SearchSourceDiscussions) {
+		classification.Sources = append(classification.Sources, SearchSourceDiscussions)
+	}
+	classification.Sources = limitAutoSources(req.Mode, classification.Sources)
 	return classification
 }
 
@@ -374,21 +451,35 @@ func (a SearchAgent) runWidgets(ctx context.Context, query string, classificatio
 }
 
 type Researcher struct {
-	SearchProvider    SearchProvider
-	EmbeddingProvider EmbeddingProvider
-	OnSearchEvent     func(context.Context, SearchEvent)
+	ResearchModel         model.Model
+	SearchProvider        SearchProvider
+	ScrapeProvider        ScrapeProvider
+	EmbeddingProvider     EmbeddingProvider
+	TextEmbeddingProvider TextEmbeddingProvider
+	OnSearchEvent         func(context.Context, SearchEvent)
 }
 
 type ResearchRequest struct {
-	Query         string
-	Mode          Mode
-	Sources       []SearchSource
-	FileIDs       []string
-	MaxIterations int
-	Now           time.Time
+	Query          string
+	Messages       []model.Message
+	Classification Classification
+	Mode           Mode
+	Sources        []SearchSource
+	FileIDs        []string
+	MaxIterations  int
+	Now            time.Time
 }
 
 func (r Researcher) Research(ctx context.Context, req ResearchRequest) ([]SearchResult, error) {
+	if r.ResearchModel != nil {
+		if results, usedTools, err := r.researchWithTools(ctx, req); usedTools {
+			return results, err
+		}
+	}
+	return r.researchDeterministic(ctx, req)
+}
+
+func (r Researcher) researchDeterministic(ctx context.Context, req ResearchRequest) ([]SearchResult, error) {
 	iterations := req.MaxIterations
 	if iterations <= 0 {
 		iterations = defaultMaxIterations(req.Mode)
