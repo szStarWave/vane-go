@@ -489,9 +489,17 @@ func (r Researcher) deepReadQuality(ctx context.Context, req ResearchRequest, qu
 	if r.ScrapeProvider == nil || len(results) == 0 {
 		return results
 	}
-	picked := r.pickQualityResults(ctx, queries, results)
+	candidates := filterQualityResults(queries, results)
+	if len(candidates) == 0 {
+		candidates = results
+	}
+	picked := r.pickQualityResults(ctx, queries, candidates)
 	if len(picked) == 0 {
-		picked = results
+		picked = candidates
+	}
+	picked = filterQualityResults(queries, picked)
+	if len(picked) == 0 {
+		picked = candidates
 	}
 	if len(picked) > 3 {
 		picked = picked[:3]
@@ -517,19 +525,23 @@ func (r Researcher) deepReadQuality(ctx context.Context, req ResearchRequest, qu
 		if strings.TrimSpace(facts) == "" {
 			facts = doc.Content
 		}
-		out = append(out, SearchResult{
+		deepResult := SearchResult{
 			Title:   firstNonEmpty(doc.Title, result.Title),
 			URL:     firstNonEmpty(doc.URL, result.URL),
 			Content: facts,
 			Source:  result.Source,
 			Stage:   "deep_read",
-		})
+		}
+		if !qualityResultRelevant(queries, deepResult) {
+			continue
+		}
+		out = append(out, deepResult)
 	}
 	if len(out) == 0 {
-		return results
+		return candidates
 	}
 	supplementalLimit := min(maxQualitySupplementalResults, totalResultLimit(req.Mode)-len(out))
-	out = append(out, supplementalQualityResults(queries, results, pickedKeys, supplementalLimit)...)
+	out = append(out, supplementalQualityResults(queries, candidates, pickedKeys, supplementalLimit)...)
 	return dedupeResults(out)
 }
 
@@ -561,6 +573,9 @@ func supplementalQualityResults(queries []string, results []SearchResult, exclud
 }
 
 func qualitySupplementalRelevant(queries []string, result SearchResult) bool {
+	if !qualityResultRelevant(queries, result) {
+		return false
+	}
 	terms := queryRelevanceTerms(queries)
 	if len(terms) == 0 {
 		return true
@@ -576,6 +591,88 @@ func qualitySupplementalRelevant(queries []string, result SearchResult) bool {
 		return matches > 0
 	}
 	return matches >= 2
+}
+
+func filterQualityResults(queries []string, results []SearchResult) []SearchResult {
+	filtered := make([]SearchResult, 0, len(results))
+	for _, result := range results {
+		if qualityResultRelevant(queries, result) {
+			filtered = append(filtered, result)
+		}
+	}
+	return filtered
+}
+
+func qualityResultRelevant(queries []string, result SearchResult) bool {
+	eventTerms := queryEventTerms(queries)
+	if len(eventTerms) == 0 {
+		return true
+	}
+	haystack := resultHaystack(result)
+	if !containsAnyTerm(haystack, eventTerms) {
+		return false
+	}
+	if genericSearchResult(result) && countTermMatches(haystack, eventTerms) < 2 {
+		return false
+	}
+	return true
+}
+
+func resultHaystack(result SearchResult) string {
+	return strings.ToLower(result.Title + "\n" + result.Content + "\n" + result.URL)
+}
+
+func containsAnyTerm(haystack string, terms []string) bool {
+	for _, term := range terms {
+		if strings.Contains(haystack, term) {
+			return true
+		}
+	}
+	return false
+}
+
+func countTermMatches(haystack string, terms []string) int {
+	matches := 0
+	for _, term := range terms {
+		if strings.Contains(haystack, term) {
+			matches++
+		}
+	}
+	return matches
+}
+
+func queryEventTerms(queries []string) []string {
+	catalog := []string{
+		"\u5927\u98ce", "\u5f3a\u98ce", "\u98ce\u66b4", "\u9f99\u5377\u98ce", "\u6c99\u5c18\u66b4",
+		"\u5f3a\u5bf9\u6d41", "\u66b4\u96e8", "\u51b0\u96f9", "\u53f0\u98ce", "\u707e\u5bb3",
+		"\u4e8b\u6545", "\u4f24\u4ea1", "\u53d7\u4f24", "\u635f\u5931", "\u53d7\u635f",
+		"\u5012\u584c", "\u5012\u4f0f", "\u5760\u843d", "\u505c\u7535", "\u4ea4\u901a",
+		"\u5217\u8f66", "\u822a\u73ed", "\u665a\u70b9", "\u9884\u8b66", "\u901a\u62a5",
+		"wind", "storm", "windstorm", "sandstorm", "tornado", "disaster", "accident",
+		"damage", "casualty", "casualties", "injured", "outage", "delay", "warning", "alert",
+	}
+	haystack := strings.ToLower(strings.Join(queries, "\n"))
+	seen := map[string]bool{}
+	var terms []string
+	for _, term := range catalog {
+		if strings.Contains(haystack, term) && !seen[term] {
+			seen[term] = true
+			terms = append(terms, term)
+		}
+	}
+	return terms
+}
+
+func genericSearchResult(result SearchResult) bool {
+	haystack := resultHaystack(result)
+	genericTerms := []string{
+		"baike.", "wikipedia.org", "britannica.com", "mafengwo.cn", "chinahighlights.com",
+		"chinadiscovery.com", "holafly.com", "travel guide", "things to do", "places to visit",
+		"attractions", "facts", "spelling", "pronunciation",
+		"\u767e\u79d1", "\u65c5\u6e38", "\u65c5\u6e38\u653b\u7565", "\u666f\u70b9",
+		"\u5fc5\u53bb", "\u82f1\u6587", "\u62fc\u5199", "\u600e\u4e48\u8bfb",
+	}
+	return containsAnyTerm(haystack, genericTerms)
 }
 
 func queryRelevanceTerms(queries []string) []string {

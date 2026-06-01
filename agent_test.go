@@ -382,6 +382,42 @@ func TestQualitySupplementalSourcesAreFilteredAndCapped(t *testing.T) {
 	}
 }
 
+func TestQualityEventResultsFilterGenericSources(t *testing.T) {
+	queries := []string{
+		"\u54c8\u5c14\u6ee8 2026\u5e745\u670831\u65e5 \u5927\u98ce \u4e8b\u6545 \u5f71\u54cd",
+		"\u54c8\u5c14\u6ee8 \u5f3a\u5bf9\u6d41 \u4ea4\u901a \u505c\u7535",
+	}
+	results := []SearchResult{
+		{
+			Title:   "\u54c8\u5c14\u6ee8\u906d\u5f3a\u5bf9\u6d41\u5929\u6c14\u4fb5\u88ad \u591a\u5730\u51fa\u73b0\u5927\u98ce\u6c99\u5c18",
+			URL:     "https://news.qq.com/rain/a/20260531A07WZI00",
+			Content: "5\u670831\u65e5\u54c8\u5c14\u6ee8\u5927\u98ce\u5bfc\u81f4\u4ea4\u901a\u53d7\u963b\u548c\u8bbe\u65bd\u53d7\u635f\u3002",
+		},
+		{
+			Title:   "Harbin Travel Guide 2026",
+			URL:     "https://www.chinahighlights.com/harbin/",
+			Content: "Harbin facts, attractions, places to visit, and travel tips.",
+		},
+		{
+			Title:   "\u54c8\u5c14\u6ee8_\u767e\u5ea6\u767e\u79d1",
+			URL:     "https://baike.baidu.com/item/%E5%93%88%E5%B0%94%E6%BB%A8",
+			Content: "\u54c8\u5c14\u6ee8\u662f\u9ed1\u9f99\u6c5f\u7701\u7701\u4f1a\u548c\u65c5\u6e38\u57ce\u5e02\u3002",
+		},
+		{
+			Title:   "Why is Harbin not spelled Haerbin",
+			URL:     "https://www.sohu.com/a/harbin-spelling",
+			Content: "A language article about Harbin spelling.",
+		},
+	}
+	got := filterQualityResults(queries, results)
+	if len(got) != 1 {
+		t.Fatalf("filtered len = %d, want 1: %#v", len(got), got)
+	}
+	if got[0].URL != results[0].URL {
+		t.Fatalf("kept result = %#v, want news result", got[0])
+	}
+}
+
 func TestChineseVerboseSearchQueryIsRepaired(t *testing.T) {
 	searcher := &recordingSearchProvider{}
 	researchModel := &scriptedResearchModel{
