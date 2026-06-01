@@ -3,6 +3,7 @@ package vane
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -21,6 +22,15 @@ func (f *fakeSearchProvider) Search(_ context.Context, query string, _ SearchOpt
 		{Title: "Duplicate", URL: "https://example.com/a", Content: "Duplicate fact"},
 		{Title: "Second", URL: "https://example.com/b", Content: "Beta fact"},
 	}, nil
+}
+
+type failingSearchProvider struct {
+	queries []string
+}
+
+func (f *failingSearchProvider) Search(_ context.Context, query string, _ SearchOptions) ([]SearchResult, error) {
+	f.queries = append(f.queries, query)
+	return nil, errors.New("search backend unavailable")
 }
 
 type captureModel struct {
@@ -73,6 +83,41 @@ func TestAnswerUsesSearchResultsInWriterPrompt(t *testing.T) {
 	}
 	if strings.Count(prompt, `https://example.com/a`) != 1 {
 		t.Fatalf("duplicate URL was not deduplicated in prompt: %s", prompt)
+	}
+}
+
+func TestAnswerUsesWriterPromptWhenSearchFails(t *testing.T) {
+	searcher := &failingSearchProvider{}
+	base := &captureModel{}
+	ch, err := Answer(context.Background(), Request{
+		Model:          base,
+		SearchProvider: searcher,
+		Mode:           ModeSpeed,
+		Messages: []model.Message{
+			model.NewUserMessage("search yesterday storm impact"),
+		},
+		Now: time.Date(2026, 6, 1, 10, 0, 0, 0, time.FixedZone("CST", 8*60*60)),
+	})
+	if err != nil {
+		t.Fatalf("Answer: %v", err)
+	}
+	for range ch {
+	}
+	if len(searcher.queries) == 0 {
+		t.Fatal("expected search to be attempted")
+	}
+	if base.req == nil || len(base.req.Messages) == 0 {
+		t.Fatal("base model did not receive writer request")
+	}
+	prompt := base.req.Messages[0].Content
+	if !strings.Contains(prompt, "<no_results>") {
+		t.Fatalf("writer prompt missing no-results guard: %s", prompt)
+	}
+	if !strings.Contains(prompt, "2026-06-01T10:00:00+08:00") {
+		t.Fatalf("writer prompt missing local current date: %s", prompt)
+	}
+	if !strings.Contains(prompt, "do not call dates before or equal to the current date") {
+		t.Fatalf("writer prompt missing future-date guard: %s", prompt)
 	}
 }
 

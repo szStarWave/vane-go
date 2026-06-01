@@ -63,6 +63,7 @@ func (r Researcher) researchWithTools(ctx context.Context, req ResearchRequest) 
 	seen := map[string]bool{}
 	var firstErr error
 	usedTools := false
+	failedInfoCalls := 0
 	for step := 0; step < iterations; step++ {
 		prompt := getResearcherPrompt(req, step, iterations)
 		ch, err := r.ResearchModel.GenerateContent(ctx, &model.Request{
@@ -153,6 +154,11 @@ func (r Researcher) researchWithTools(ctx context.Context, req ResearchRequest) 
 				ResultCount: len(actionResult.Results),
 				Results:     actionResult.Results,
 			})
+			if isInformationTool(name) && len(actionResult.Results) == 0 && (err != nil || actionResult.Error != "") {
+				failedInfoCalls++
+			} else if len(actionResult.Results) > 0 {
+				failedInfoCalls = 0
+			}
 			if len(out) > before {
 				emitSearchEvent(ctx, r.OnSearchEvent, SearchEvent{
 					Type:        SearchEventResults,
@@ -173,6 +179,9 @@ func (r Researcher) researchWithTools(ctx context.Context, req ResearchRequest) 
 		if done || len(out) >= totalResultLimit(req.Mode) {
 			break
 		}
+		if failedInfoCalls >= maxFailedInformationToolCalls(req.Mode) {
+			break
+		}
 	}
 	emitSearchEvent(ctx, r.OnSearchEvent, SearchEvent{
 		Type:        SearchEventEnd,
@@ -182,6 +191,24 @@ func (r Researcher) researchWithTools(ctx context.Context, req ResearchRequest) 
 		Results:     append([]SearchResult(nil), out...),
 	})
 	return out, usedTools, firstErr
+}
+
+func isInformationTool(name string) bool {
+	switch name {
+	case "web_search", "academic_search", "social_search", "uploads_search", "scrape_url":
+		return true
+	default:
+		return false
+	}
+}
+
+func maxFailedInformationToolCalls(mode Mode) int {
+	switch mode {
+	case ModeQuality:
+		return 4
+	default:
+		return 3
+	}
 }
 
 func (r Researcher) availableResearchTools(req ResearchRequest) map[string]tool.Tool {
@@ -199,16 +226,16 @@ func (r Researcher) availableResearchTools(req ResearchRequest) map[string]tool.
 		)
 	}
 	if hasSource(req.Sources, SearchSourceWeb) && !req.Classification.SkipSearch {
-		tools["web_search"] = r.queryTool("web_search", SearchSourceWeb, "Perform web searches for concise targeted queries.")
+		tools["web_search"] = r.queryTool(req, "web_search", SearchSourceWeb, "Perform web searches for concise targeted queries.")
 	}
 	if hasSource(req.Sources, SearchSourceAcademic) && req.Classification.AcademicSearch && !req.Classification.SkipSearch {
-		tools["academic_search"] = r.queryTool("academic_search", SearchSourceAcademic, "Search scholarly, paper, benchmark, official report, and research-oriented sources.")
+		tools["academic_search"] = r.queryTool(req, "academic_search", SearchSourceAcademic, "Search scholarly, paper, benchmark, official report, and research-oriented sources.")
 	}
 	if hasSource(req.Sources, SearchSourceDiscussions) && req.Classification.DiscussionSearch && !req.Classification.SkipSearch {
-		tools["social_search"] = r.queryTool("social_search", SearchSourceDiscussions, "Search community discussions, issues, forums, and social feedback.")
+		tools["social_search"] = r.queryTool(req, "social_search", SearchSourceDiscussions, "Search community discussions, issues, forums, and social feedback.")
 	}
 	if len(req.FileIDs) > 0 && r.EmbeddingProvider != nil {
-		tools["uploads_search"] = r.queryTool("uploads_search", SearchSourceUploads, "Search the user's uploaded files and personal documents.")
+		tools["uploads_search"] = r.queryTool(req, "uploads_search", SearchSourceUploads, "Search the user's uploaded files and personal documents.")
 	}
 	tools["scrape_url"] = function.NewFunctionTool(
 		func(ctx context.Context, args scrapeURLArgs) (researchActionResult, error) {
@@ -231,10 +258,10 @@ func (r Researcher) availableResearchTools(req ResearchRequest) map[string]tool.
 	return tools
 }
 
-func (r Researcher) queryTool(name string, source SearchSource, description string) tool.Tool {
+func (r Researcher) queryTool(req ResearchRequest, name string, source SearchSource, description string) tool.Tool {
 	return function.NewFunctionTool(
 		func(ctx context.Context, args queryActionArgs) (researchActionResult, error) {
-			results, err := r.executeQueries(ctx, currentResearchRequest(ctx), source, args.Queries)
+			results, err := r.executeQueries(ctx, req, source, args.Queries)
 			res := researchActionResult{Type: "search_results", Results: results}
 			if err != nil {
 				res.Error = err.Error()
@@ -249,19 +276,7 @@ func (r Researcher) queryTool(name string, source SearchSource, description stri
 	)
 }
 
-type researchRequestContextKey struct{}
-
-func withResearchRequest(ctx context.Context, req ResearchRequest) context.Context {
-	return context.WithValue(ctx, researchRequestContextKey{}, req)
-}
-
-func currentResearchRequest(ctx context.Context) ResearchRequest {
-	req, _ := ctx.Value(researchRequestContextKey{}).(ResearchRequest)
-	return req
-}
-
 func (r Researcher) executeResearchTool(ctx context.Context, req ResearchRequest, name string, args []byte, step int) (researchActionResult, error) {
-	ctx = withResearchRequest(ctx, req)
 	switch name {
 	case "__reasoning_preamble":
 		var parsed planActionArgs

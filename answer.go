@@ -35,6 +35,10 @@ func Answer(ctx context.Context, req Request) (<-chan *model.Response, error) {
 	if mode == "" {
 		mode = ModeBalanced
 	}
+	now := req.Now
+	if now.IsZero() {
+		now = time.Now()
+	}
 	agent := SearchAgent{
 		ClassifierModel:       req.Model,
 		ResearchModel:         firstModel(req.ResearchModel, req.Model),
@@ -52,27 +56,26 @@ func Answer(ctx context.Context, req Request) (<-chan *model.Response, error) {
 		Sources:       req.Sources,
 		FileIDs:       req.FileIDs,
 		MaxIterations: req.MaxIterations,
-		Now:           req.Now,
+		Now:           now,
 	})
-	if err != nil || len(result.Sources) == 0 {
+	if err != nil {
+		notifySearchError(req.OnSearchError, err)
+		emitSearchEvent(ctx, req.OnSearchEvent, SearchEvent{
+			Type:  SearchEventError,
+			Mode:  mode,
+			Query: query,
+			Error: err.Error(),
+		})
+	}
+	if !result.Classification.ShouldSearch && len(result.Sources) == 0 && len(result.Widgets) == 0 {
 		if err != nil {
-			notifySearchError(req.OnSearchError, err)
-			emitSearchEvent(ctx, req.OnSearchEvent, SearchEvent{
-				Type:  SearchEventError,
-				Mode:  mode,
-				Query: query,
-				Error: err.Error(),
-			})
+			return fallbackGenerate(ctx, req.Model, req.Messages, &req.GenerationConfig), nil
 		}
 		return req.Model.GenerateContent(ctx, &model.Request{
 			Messages:         req.Messages,
 			GenerationConfig: withStreaming(req.GenerationConfig),
 			ExtraFields:      req.ExtraFields,
 		})
-	}
-	now := req.Now
-	if now.IsZero() {
-		now = time.Now().UTC()
 	}
 	genConfig := withStreaming(req.GenerationConfig)
 	if genConfig.Temperature == nil {
@@ -272,6 +275,10 @@ func formatSearchContext(results []SearchResult) string {
 	var b strings.Builder
 	b.WriteString(`<search_results note="These are web search results. Cite them with [number] notation.">`)
 	b.WriteString("\n")
+	if len(results) == 0 {
+		b.WriteString(`<no_results>Search was attempted, but no usable source results were retrieved. Do not answer live or current factual claims as known facts without sources.</no_results>`)
+		b.WriteString("\n")
+	}
 	for i, result := range results {
 		title := xmlishEscape(result.Title)
 		content := xmlishEscape(result.Content)
@@ -312,13 +319,15 @@ Your task:
 - Cite source-backed claims with [number] notation matching the search result index.
 - Every paragraph that relies on web facts should include citations.
 - If the context is insufficient, say what is missing instead of inventing facts.
+- If search_results contains no result entries, clearly say the search did not retrieve usable sources and do not claim current events from memory.
+- Use the current date below when interpreting relative dates; do not call dates before or equal to the current date "future".
 - Do not cite facts that are not supported by the context.
 - Prefer direct, useful answers over explaining the search process.%s
 
 User instructions:
 %s
 
-Current date and time (UTC): %s
+Current date and time: %s
 
 <context>
 %s

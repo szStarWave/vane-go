@@ -3,6 +3,7 @@ package vane
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -313,6 +314,43 @@ func TestQualityResearchScrapesAndExtractsFacts(t *testing.T) {
 	}
 }
 
+func TestResearcherStopsAfterRepeatedSearchFailures(t *testing.T) {
+	searcher := &alwaysFailingSearchProvider{}
+	researchModel := &scriptedResearchModel{calls: [][]model.ToolCall{
+		{toolCall("search-1", "web_search", map[string]any{"queries": []string{"failed query 1"}})},
+		{toolCall("search-2", "web_search", map[string]any{"queries": []string{"failed query 2"}})},
+		{toolCall("search-3", "web_search", map[string]any{"queries": []string{"failed query 3"}})},
+		{toolCall("search-4", "web_search", map[string]any{"queries": []string{"failed query 4"}})},
+		{toolCall("search-5", "web_search", map[string]any{"queries": []string{"should not run"}})},
+	}}
+	researcher := Researcher{
+		ResearchModel:  researchModel,
+		SearchProvider: searcher,
+	}
+	results, err := researcher.Research(context.Background(), ResearchRequest{
+		Query: "Harbin storm accidents",
+		Classification: Classification{
+			ShouldSearch:       true,
+			StandaloneFollowUp: "Harbin storm accidents",
+			Sources:            []SearchSource{SearchSourceWeb},
+		},
+		Mode:    ModeQuality,
+		Sources: []SearchSource{SearchSourceWeb},
+	})
+	if err == nil {
+		t.Fatal("Research error = nil, want search backend error")
+	}
+	if len(results) != 0 {
+		t.Fatalf("results = %#v, want empty on repeated failures", results)
+	}
+	if len(searcher.queries) != maxFailedInformationToolCalls(ModeQuality) {
+		t.Fatalf("queries = %#v, want %d failed attempts", searcher.queries, maxFailedInformationToolCalls(ModeQuality))
+	}
+	if len(researchModel.requests) > maxFailedInformationToolCalls(ModeQuality) {
+		t.Fatalf("research model calls = %d, want capped after repeated failures", len(researchModel.requests))
+	}
+}
+
 type staticTextModel struct {
 	text string
 }
@@ -328,6 +366,15 @@ func (p *recordingSearchProvider) Search(_ context.Context, query string, _ Sear
 		URL:     "https://example.com/harbin-tornado",
 		Content: "2026\u5e745\u670831\u65e5\u54c8\u5c14\u6ee8\u51fa\u73b0\u5927\u98ce\u548c\u9f99\u5377\u98ce\u76f8\u5173\u62a5\u9053\u3002",
 	}}, nil
+}
+
+type alwaysFailingSearchProvider struct {
+	queries []string
+}
+
+func (p *alwaysFailingSearchProvider) Search(_ context.Context, query string, _ SearchOptions) ([]SearchResult, error) {
+	p.queries = append(p.queries, query)
+	return nil, errors.New("search backend unavailable")
 }
 
 func (m *staticTextModel) Info() model.Info { return model.Info{Name: "static"} }
