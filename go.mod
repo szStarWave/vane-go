@@ -3,7 +3,7 @@ module github.com/szStarWave/vane-go
 go 1.26
 
 require (
-	github.com/szStarWave/websurfx-go v0.1.1
+	github.com/szStarWave/websurfx-go v0.1.2
 	trpc.group/trpc-go/trpc-agent-go v1.9.1
 )
 
