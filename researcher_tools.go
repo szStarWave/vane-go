@@ -35,6 +35,14 @@ type scrapeURLArgs struct {
 	URLs []string `json:"urls"`
 }
 
+const (
+	extractFactsMinRunes  = 1200
+	extractFactsChunkSize = 6000
+	extractFactsOverlap   = 300
+	extractFactsMaxChunks = 3
+	extractFactsMaxTokens = 600
+)
+
 func (r Researcher) researchWithTools(ctx context.Context, req ResearchRequest) ([]SearchResult, bool, error) {
 	iterations := req.MaxIterations
 	if iterations <= 0 {
@@ -1007,13 +1015,20 @@ func (r Researcher) pickQualityResults(ctx context.Context, queries []string, re
 }
 
 func (r Researcher) extractFacts(ctx context.Context, req ResearchRequest, queries []string, content string, title string) string {
-	if r.ResearchModel == nil {
+	content = strings.TrimSpace(content)
+	if r.ResearchModel == nil || !shouldExtractFactsWithModel(content) {
 		return content
 	}
-	chunks := splitText(content, 4000, 500)
+	chunks := splitText(content, extractFactsChunkSize, extractFactsOverlap)
+	if len(chunks) > extractFactsMaxChunks {
+		chunks = chunks[:extractFactsMaxChunks]
+	}
+	if len(chunks) == 0 {
+		return content
+	}
 	out := make([]string, len(chunks))
 	var wg sync.WaitGroup
-	sem := make(chan struct{}, effectiveConcurrency(ModeQuality, r.Concurrency))
+	sem := make(chan struct{}, effectiveConcurrency(ModeQuality, firstPositive(req.Concurrency, r.Concurrency)))
 	for i, chunk := range chunks {
 		i, chunk := i, chunk
 		wg.Add(1)
@@ -1039,7 +1054,7 @@ func (r Researcher) extractFacts(ctx context.Context, req ResearchRequest, queri
 					model.NewSystemMessage("You are Vane's information extractor. Return compact JSON only: {\"extracted_facts\":\"- Fact\"}. Extract only facts relevant to the queries, preserve raw numbers and table values, remove boilerplate."),
 					model.NewUserMessage(fmt.Sprintf("<queries>%s</queries>\n<scraped_data>%s</scraped_data>", strings.Join(queries, ", "), chunk)),
 				},
-				GenerationConfig: model.GenerationConfig{Stream: false, Temperature: floatPtr(0), MaxTokens: intPtr(900)},
+				GenerationConfig: model.GenerationConfig{Stream: false, Temperature: floatPtr(0), MaxTokens: intPtr(extractFactsMaxTokens)},
 			})
 			if err != nil {
 				return
@@ -1057,7 +1072,15 @@ func (r Researcher) extractFacts(ctx context.Context, req ResearchRequest, queri
 		}()
 	}
 	wg.Wait()
-	return strings.TrimSpace(strings.Join(nonEmptyStrings(out), "\n"))
+	extracted := strings.TrimSpace(strings.Join(nonEmptyStrings(out), "\n"))
+	if extracted == "" {
+		return content
+	}
+	return extracted
+}
+
+func shouldExtractFactsWithModel(content string) bool {
+	return len([]rune(strings.TrimSpace(content))) >= extractFactsMinRunes
 }
 
 func (r Researcher) scrapeURLs(ctx context.Context, req ResearchRequest, urls []string) (researchActionResult, error) {
@@ -1136,8 +1159,8 @@ Research iteration: %d of %d
 <quality_mode>
 - You are a deep-research orchestrator. Follow an iterative reason-act loop.
 - You MUST call __reasoning_preamble before every tool call in this assistant turn, including done. If you do not call it, the following tool call should be treated as invalid.
-- Use up to 10 tool calls total in this turn even though the outer loop may allow more iterations.
-- Unless the question is very simple, aim for 4-7 information-gathering calls across several web_search calls.
+- Use up to 8 tool calls total in this turn even though the outer loop may allow more iterations.
+- Unless the question is very simple, aim for 3-5 information-gathering calls across several web_search calls.
 - Start broad, then narrow: overview, official reports, timeline, impact, statistics, disputes, conflicting accounts, missing angles, and reputable local coverage.
 - Each web_search call can contain at most 3 concise queries.
 - Do not call done early. Call done only after the gathered sources cover the main claims, important gaps, and uncertainty.
@@ -1203,7 +1226,7 @@ If this tool is present and no other tools are more relevant, you MUST use this 
 		return common + `
 You have to call this tool several times to gather enough information unless the question is very simple (like greeting questions or basic facts).
 Start initially with broader queries to get an overview, then narrow down with more specific queries based on the results you receive.
-Never stop before at least 5-6 iterations of searches unless the user question is very simple.
+Do not stop before at least 3 information attempts unless the user question is very simple or the gathered sources are already strong.
 If this tool is present and no other tools are more relevant, you MUST use this tool to get the needed information. You can call this tool multiple times as needed.`
 	default:
 		return common + `

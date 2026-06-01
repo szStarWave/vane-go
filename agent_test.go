@@ -301,7 +301,7 @@ func TestQualityResearchScrapesAndExtractsFacts(t *testing.T) {
 	researcher := Researcher{
 		ResearchModel:  researchModel,
 		SearchProvider: searcher,
-		ScrapeProvider: staticScrapeProvider{content: "Long article: tornado caused power outage and traffic disruption."},
+		ScrapeProvider: staticScrapeProvider{content: longArticleContent()},
 		OnSearchEvent: func(_ context.Context, ev SearchEvent) {
 			events = append(events, ev)
 		},
@@ -329,6 +329,45 @@ func TestQualityResearchScrapesAndExtractsFacts(t *testing.T) {
 	}
 }
 
+func TestQualityResearchSkipsExtractorForShortScrapes(t *testing.T) {
+	searcher := &recordingSearchProvider{}
+	researchModel := &scriptedResearchModel{calls: [][]model.ToolCall{
+		{toolCall("search-1", "web_search", map[string]any{"queries": []string{"Harbin tornado official report"}})},
+		{toolCall("done-1", "done", map[string]any{})},
+	}}
+	var events []SearchEvent
+	researcher := Researcher{
+		ResearchModel:  researchModel,
+		SearchProvider: searcher,
+		ScrapeProvider: staticScrapeProvider{content: "Short report: tornado caused power outage and traffic disruption."},
+		OnSearchEvent: func(_ context.Context, ev SearchEvent) {
+			events = append(events, ev)
+		},
+	}
+	results, err := researcher.Research(context.Background(), ResearchRequest{
+		Query: "Harbin tornado impacts",
+		Classification: Classification{
+			ShouldSearch:       true,
+			StandaloneFollowUp: "Harbin tornado impacts",
+			Sources:            []SearchSource{SearchSourceWeb},
+		},
+		Mode:    ModeQuality,
+		Sources: []SearchSource{SearchSourceWeb},
+	})
+	if err != nil {
+		t.Fatalf("Research: %v", err)
+	}
+	if len(results) == 0 || !strings.Contains(results[0].Content, "Short report") {
+		t.Fatalf("quality results = %#v, want original short scraped content", results)
+	}
+	if hasSearchEventPhase(events, "extract_facts") {
+		t.Fatalf("short scrape should not run extractor: %#v", events)
+	}
+	if countResearchRequestsContaining(researchModel.requests, "information extractor") != 0 {
+		t.Fatalf("short scrape invoked extractor model")
+	}
+}
+
 func TestQualityResearchKeepsSupplementalSearchSources(t *testing.T) {
 	searcher := &manySearchProvider{}
 	researchModel := &scriptedResearchModel{calls: [][]model.ToolCall{
@@ -338,7 +377,7 @@ func TestQualityResearchKeepsSupplementalSearchSources(t *testing.T) {
 	researcher := Researcher{
 		ResearchModel:  researchModel,
 		SearchProvider: searcher,
-		ScrapeProvider: staticScrapeProvider{content: "Long article: tornado caused power outage and traffic disruption."},
+		ScrapeProvider: staticScrapeProvider{content: longArticleContent()},
 	}
 	results, err := researcher.Research(context.Background(), ResearchRequest{
 		Query: "Harbin tornado impacts",
@@ -361,6 +400,23 @@ func TestQualityResearchKeepsSupplementalSearchSources(t *testing.T) {
 	}
 	if !strings.Contains(results[len(results)-1].Content, "Search snippet") {
 		t.Fatalf("last result content = %q, want supplemental search snippet", results[len(results)-1].Content)
+	}
+}
+
+func TestExtractFactsCapsChunks(t *testing.T) {
+	researchModel := &scriptedResearchModel{}
+	researcher := Researcher{ResearchModel: researchModel}
+	content := strings.Repeat("Harbin tornado damaged power lines and disrupted traffic. ", 700)
+	got := researcher.extractFacts(context.Background(), ResearchRequest{
+		Query:       "Harbin tornado impacts",
+		Mode:        ModeQuality,
+		Concurrency: 1,
+	}, []string{"Harbin tornado impacts"}, content, "Long article")
+	if !strings.Contains(got, "Extracted tornado fact") {
+		t.Fatalf("extractFacts = %q, want extracted facts", got)
+	}
+	if got := countResearchRequestsContaining(researchModel.requests, "information extractor"); got != extractFactsMaxChunks {
+		t.Fatalf("extractor calls = %d, want cap %d", got, extractFactsMaxChunks)
 	}
 }
 
@@ -551,7 +607,7 @@ func TestWebSearchActionDescriptionMatchesOriginalQueryGuidance(t *testing.T) {
 		"Your queries shouldn't be sentences",
 		"SEO friendly",
 		"Start initially with broader queries",
-		"Never stop before at least 5-6 iterations of searches",
+		"Do not stop before at least 3 information attempts",
 	} {
 		if !strings.Contains(desc, want) {
 			t.Fatalf("web search description missing %q: %s", want, desc)
@@ -570,7 +626,7 @@ func TestQualityResearcherPromptRequiresMultiRoundSearch(t *testing.T) {
 		Mode:    ModeQuality,
 		Sources: []SearchSource{SearchSourceWeb},
 	}, 0, defaultMaxIterations(ModeQuality))
-	if !strings.Contains(prompt, "aim for 4-7 information-gathering calls") ||
+	if !strings.Contains(prompt, "aim for 3-5 information-gathering calls") ||
 		!strings.Contains(prompt, "You MUST call __reasoning_preamble before every tool call") ||
 		!strings.Contains(prompt, "Start broad, then narrow") {
 		t.Fatalf("quality researcher prompt missing multi-round guidance: %s", prompt)
@@ -949,6 +1005,23 @@ func hasSearchEventPhase(events []SearchEvent, phase string) bool {
 		}
 	}
 	return false
+}
+
+func countResearchRequestsContaining(requests []*model.Request, needle string) int {
+	count := 0
+	for _, req := range requests {
+		if req == nil || len(req.Messages) == 0 {
+			continue
+		}
+		if strings.Contains(req.Messages[0].Content, needle) {
+			count++
+		}
+	}
+	return count
+}
+
+func longArticleContent() string {
+	return strings.Repeat("Long article: tornado caused power outage and traffic disruption. ", 30)
 }
 
 func lastSearchEventOfType(events []SearchEvent, typ SearchEventType) *SearchEvent {
