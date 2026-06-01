@@ -400,7 +400,11 @@ func (r Researcher) deepReadQuality(ctx context.Context, req ResearchRequest, qu
 		picked = picked[:3]
 	}
 	var out []SearchResult
+	pickedKeys := map[string]bool{}
 	for _, result := range picked {
+		if key := canonicalResultKey(result); key != "" {
+			pickedKeys[key] = true
+		}
 		if strings.TrimSpace(result.URL) == "" {
 			out = append(out, result)
 			continue
@@ -423,6 +427,25 @@ func (r Researcher) deepReadQuality(ctx context.Context, req ResearchRequest, qu
 	}
 	if len(out) == 0 {
 		return results
+	}
+	out = append(out, supplementalQualityResults(results, pickedKeys, totalResultLimit(req.Mode)-len(out))...)
+	return dedupeResults(out)
+}
+
+func supplementalQualityResults(results []SearchResult, exclude map[string]bool, limit int) []SearchResult {
+	if limit <= 0 {
+		return nil
+	}
+	var out []SearchResult
+	for _, result := range results {
+		key := canonicalResultKey(result)
+		if key == "" || exclude[key] {
+			continue
+		}
+		out = append(out, result)
+		if len(out) >= limit {
+			break
+		}
 	}
 	return out
 }
@@ -551,7 +574,7 @@ Research iteration: %d of %d
 	case ModeSpeed:
 		return base + "\nSpeed mode: act quickly. One strong search call followed by done is usually enough."
 	case ModeQuality:
-		return base + "\nQuality mode: perform deep multi-angle research. Use __reasoning_preamble before non-done tools, follow up on gaps, and prefer comprehensive coverage before done."
+		return base + "\nQuality mode: perform deep multi-angle research. You usually need several web_search calls unless the question is very simple. Start with broad overview queries, then narrow down with follow-up queries for official reports, timelines, impacts, disputes, statistics, and missing angles. Use __reasoning_preamble before non-done tools. Do not call done until the gathered sources cover the main claims and important gaps."
 	default:
 		return base + "\nBalanced mode: use __reasoning_preamble before non-done tools and gather enough evidence without over-searching."
 	}
@@ -563,7 +586,11 @@ func researchActionDescriptions(req ResearchRequest) string {
 		parts = append(parts, `<tool name="__reasoning_preamble">State a concise natural-language plan before other tools.</tool>`)
 	}
 	if hasSource(req.Sources, SearchSourceWeb) {
-		parts = append(parts, `<tool name="web_search">Search the web for current or factual information.</tool>`)
+		if req.Mode == ModeQuality {
+			parts = append(parts, `<tool name="web_search">Search the web for current or factual information. In quality mode, call this tool several times as needed: start broad, then narrow to official reports, timeline, impacts, statistics, and conflicting accounts. Provide up to 3 concise queries per call.</tool>`)
+		} else {
+			parts = append(parts, `<tool name="web_search">Search the web for current or factual information.</tool>`)
+		}
 	}
 	if hasSource(req.Sources, SearchSourceAcademic) && req.Classification.AcademicSearch {
 		parts = append(parts, `<tool name="academic_search">Search academic, paper, benchmark, study, official report, or research sources.</tool>`)

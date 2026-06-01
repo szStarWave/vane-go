@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -314,6 +315,57 @@ func TestQualityResearchScrapesAndExtractsFacts(t *testing.T) {
 	}
 }
 
+func TestQualityResearchKeepsSupplementalSearchSources(t *testing.T) {
+	searcher := &manySearchProvider{}
+	researchModel := &scriptedResearchModel{calls: [][]model.ToolCall{
+		{toolCall("search-1", "web_search", map[string]any{"queries": []string{"Harbin tornado official report"}})},
+		{toolCall("done-1", "done", map[string]any{})},
+	}}
+	researcher := Researcher{
+		ResearchModel:  researchModel,
+		SearchProvider: searcher,
+		ScrapeProvider: staticScrapeProvider{content: "Long article: tornado caused power outage and traffic disruption."},
+	}
+	results, err := researcher.Research(context.Background(), ResearchRequest{
+		Query: "Harbin tornado impacts",
+		Classification: Classification{
+			ShouldSearch:       true,
+			StandaloneFollowUp: "Harbin tornado impacts",
+			Sources:            []SearchSource{SearchSourceWeb},
+		},
+		Mode:    ModeQuality,
+		Sources: []SearchSource{SearchSourceWeb},
+	})
+	if err != nil {
+		t.Fatalf("Research: %v", err)
+	}
+	if len(results) <= 3 {
+		t.Fatalf("quality results = %d, want deep-read results plus supplemental search sources: %#v", len(results), results)
+	}
+	if !strings.Contains(results[0].Content, "Extracted tornado fact") {
+		t.Fatalf("first result content = %q, want extracted deep-read facts", results[0].Content)
+	}
+	if !strings.Contains(results[len(results)-1].Content, "Search snippet") {
+		t.Fatalf("last result content = %q, want supplemental search snippet", results[len(results)-1].Content)
+	}
+}
+
+func TestQualityResearcherPromptRequiresMultiRoundSearch(t *testing.T) {
+	prompt := getResearcherPrompt(ResearchRequest{
+		Query: "Harbin tornado impacts",
+		Classification: Classification{
+			ShouldSearch:       true,
+			StandaloneFollowUp: "Harbin tornado impacts",
+			Sources:            []SearchSource{SearchSourceWeb},
+		},
+		Mode:    ModeQuality,
+		Sources: []SearchSource{SearchSourceWeb},
+	}, 0, defaultMaxIterations(ModeQuality))
+	if !strings.Contains(prompt, "several web_search calls") || !strings.Contains(prompt, "Start with broad overview queries") {
+		t.Fatalf("quality researcher prompt missing multi-round guidance: %s", prompt)
+	}
+}
+
 func TestResearcherStopsAfterRepeatedSearchFailures(t *testing.T) {
 	searcher := &alwaysFailingSearchProvider{}
 	researchModel := &scriptedResearchModel{calls: [][]model.ToolCall{
@@ -366,6 +418,25 @@ func (p *recordingSearchProvider) Search(_ context.Context, query string, _ Sear
 		URL:     "https://example.com/harbin-tornado",
 		Content: "2026\u5e745\u670831\u65e5\u54c8\u5c14\u6ee8\u51fa\u73b0\u5927\u98ce\u548c\u9f99\u5377\u98ce\u76f8\u5173\u62a5\u9053\u3002",
 	}}, nil
+}
+
+type manySearchProvider struct{}
+
+func (p *manySearchProvider) Search(_ context.Context, query string, opts SearchOptions) ([]SearchResult, error) {
+	limit := opts.Limit
+	if limit <= 0 {
+		limit = 10
+	}
+	results := make([]SearchResult, 0, limit)
+	for i := 0; i < limit; i++ {
+		results = append(results, SearchResult{
+			Title:   fmt.Sprintf("Result %d", i+1),
+			URL:     fmt.Sprintf("https://example.com/result-%d", i+1),
+			Content: fmt.Sprintf("Search snippet %d for %s", i+1, query),
+			Source:  opts.Source,
+		})
+	}
+	return results, nil
 }
 
 type alwaysFailingSearchProvider struct {
