@@ -36,6 +36,7 @@ func Answer(ctx context.Context, req Request) (<-chan *model.Response, error) {
 		mode = ModeBalanced
 	}
 	agent := SearchAgent{
+		ClassifierModel:   req.Model,
 		SearchProvider:    provider,
 		EmbeddingProvider: req.EmbeddingProvider,
 		WidgetProviders:   req.WidgetProviders,
@@ -425,6 +426,10 @@ func xmlishEscape(value string) string {
 }
 
 func floatPtr(value float64) *float64 {
+	return &value
+}
+
+func intPtr(value int) *int {
 	return &value
 }
 

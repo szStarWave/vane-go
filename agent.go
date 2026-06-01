@@ -2,15 +2,18 @@ package vane
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"trpc.group/trpc-go/trpc-agent-go/model"
 )
 
 type SearchAgent struct {
+	ClassifierModel   model.Model
 	SearchProvider    SearchProvider
 	EmbeddingProvider EmbeddingProvider
 	WidgetProviders   WidgetProviders
@@ -37,7 +40,7 @@ func (a SearchAgent) Run(ctx context.Context, req SearchAgentRequest) (SearchAge
 	if mode == "" {
 		mode = ModeBalanced
 	}
-	classification := classifySearch(req)
+	classification := a.classify(ctx, req)
 	emitSearchEvent(ctx, a.OnSearchEvent, SearchEvent{
 		Type:           SearchEventClassification,
 		Mode:           mode,
@@ -86,6 +89,184 @@ func (a SearchAgent) Run(ctx context.Context, req SearchAgentRequest) (SearchAge
 		Sources:        sources,
 		Widgets:        widgets,
 	}, err
+}
+
+func (a SearchAgent) classify(ctx context.Context, req SearchAgentRequest) Classification {
+	fallback := classifySearch(req)
+	if a.ClassifierModel == nil || strings.TrimSpace(req.Query) == "" {
+		return fallback
+	}
+	classifyCtx, cancel := context.WithTimeout(ctx, classifierTimeout(req.Mode))
+	defer cancel()
+	cfg := model.GenerationConfig{
+		Stream:      false,
+		Temperature: floatPtr(0),
+		MaxTokens:   intPtr(360),
+	}
+	ch, err := a.ClassifierModel.GenerateContent(classifyCtx, &model.Request{
+		Messages: []model.Message{
+			model.NewSystemMessage(classifierSystemPrompt()),
+			model.NewUserMessage(classifierUserPrompt(req)),
+		},
+		GenerationConfig: cfg,
+	})
+	if err != nil {
+		return fallback
+	}
+	text, err := collectResponseText(classifyCtx, ch)
+	if err != nil || strings.TrimSpace(text) == "" {
+		return fallback
+	}
+	classification, err := parseClassifierJSON(text, req, fallback)
+	if err != nil {
+		return fallback
+	}
+	return classification
+}
+
+func classifierTimeout(mode Mode) time.Duration {
+	switch mode {
+	case ModeSpeed:
+		return 2500 * time.Millisecond
+	case ModeQuality:
+		return 8 * time.Second
+	default:
+		return 5 * time.Second
+	}
+}
+
+func classifierSystemPrompt() string {
+	return `You are Vane's search intent classifier. Return only compact JSON.
+
+Schema:
+{
+  "should_search": boolean,
+  "intent": string,
+  "reason": string,
+  "sources": ["web" | "discussions" | "academic"],
+  "need_weather": boolean,
+  "need_stock": boolean,
+  "need_calc": boolean
+}
+
+Rules:
+- Always include "web" when should_search is true.
+- Add "academic" for papers, benchmarks, studies, research evidence, official reports, scientific/medical/policy/technical evaluation questions.
+- Add "discussions" for community feedback, real user experience, bugs, issues, complaints, Reddit/HN/forum/GitHub issue style questions.
+- Do not include uploads; file search is controlled outside this classifier.
+- For casual greetings or pure chat, set should_search=false.
+- For arithmetic, set need_calc=true.`
+}
+
+func classifierUserPrompt(req SearchAgentRequest) string {
+	return fmt.Sprintf("Mode: %s\nEnabled baseline sources: %s\nLatest user query:\n%s", req.Mode, joinSources(normalizeSources(req.Sources, req.FileIDs)), strings.TrimSpace(req.Query))
+}
+
+func joinSources(sources []SearchSource) string {
+	values := make([]string, 0, len(sources))
+	for _, source := range sources {
+		values = append(values, string(source))
+	}
+	return strings.Join(values, ", ")
+}
+
+type classifierJSON struct {
+	ShouldSearch *bool          `json:"should_search"`
+	Intent       string         `json:"intent"`
+	Reason       string         `json:"reason"`
+	Sources      []SearchSource `json:"sources"`
+	NeedWeather  *bool          `json:"need_weather"`
+	NeedStock    *bool          `json:"need_stock"`
+	NeedCalc     *bool          `json:"need_calc"`
+}
+
+func parseClassifierJSON(text string, req SearchAgentRequest, fallback Classification) (Classification, error) {
+	raw := strings.TrimSpace(text)
+	if start := strings.Index(raw, "{"); start >= 0 {
+		raw = raw[start:]
+	}
+	if end := strings.LastIndex(raw, "}"); end >= 0 {
+		raw = raw[:end+1]
+	}
+	var parsed classifierJSON
+	if err := json.Unmarshal([]byte(raw), &parsed); err != nil {
+		return Classification{}, err
+	}
+	out := fallback
+	if parsed.ShouldSearch != nil {
+		out.ShouldSearch = *parsed.ShouldSearch
+	}
+	if strings.TrimSpace(parsed.Intent) != "" {
+		out.Intent = strings.TrimSpace(parsed.Intent)
+	}
+	if strings.TrimSpace(parsed.Reason) != "" {
+		out.Reason = strings.TrimSpace(parsed.Reason)
+	}
+	if parsed.NeedWeather != nil {
+		out.NeedWeather = *parsed.NeedWeather
+	}
+	if parsed.NeedStock != nil {
+		out.NeedStock = *parsed.NeedStock
+	}
+	if parsed.NeedCalc != nil {
+		out.NeedCalc = *parsed.NeedCalc
+	}
+	if out.ShouldSearch {
+		out.Sources = classifierSources(req, parsed.Sources)
+		out.SkipReason = ""
+	} else if out.SkipReason == "" {
+		out.SkipReason = "model classified as no-search"
+	}
+	out.NeedUploads = len(req.FileIDs) > 0
+	if out.NeedUploads && !hasSource(out.Sources, SearchSourceUploads) {
+		out.Sources = append(out.Sources, SearchSourceUploads)
+	}
+	return out, nil
+}
+
+func classifierSources(req SearchAgentRequest, modelSources []SearchSource) []SearchSource {
+	sources := normalizeSources(append([]SearchSource{}, req.Sources...), req.FileIDs)
+	for _, source := range modelSources {
+		switch source {
+		case SearchSourceWeb, SearchSourceDiscussions, SearchSourceAcademic:
+			if !hasSource(sources, source) {
+				sources = append(sources, source)
+			}
+		}
+	}
+	if !hasSource(sources, SearchSourceWeb) {
+		sources = append([]SearchSource{SearchSourceWeb}, sources...)
+	}
+	return limitAutoSources(req.Mode, sources)
+}
+
+func limitAutoSources(mode Mode, sources []SearchSource) []SearchSource {
+	if mode != ModeSpeed {
+		return sources
+	}
+	out := []SearchSource{SearchSourceWeb}
+	for _, source := range sources {
+		if source != SearchSourceWeb {
+			out = append(out, source)
+			break
+		}
+	}
+	return out
+}
+
+func collectResponseText(ctx context.Context, ch <-chan *model.Response) (string, error) {
+	var b strings.Builder
+	for {
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case rsp, ok := <-ch:
+			if !ok {
+				return b.String(), nil
+			}
+			b.WriteString(responseText(rsp))
+		}
+	}
 }
 
 func classifySearch(req SearchAgentRequest) Classification {

@@ -2,7 +2,9 @@ package vane
 
 import (
 	"context"
+	"strings"
 	"testing"
+	"time"
 
 	"trpc.group/trpc-go/trpc-agent-go/model"
 )
@@ -90,4 +92,71 @@ func TestCalculationWidgetEvaluatesExpression(t *testing.T) {
 	if got.Content != "84" {
 		t.Fatalf("content = %q, want 84", got.Content)
 	}
+}
+
+func TestLLMClassifierAddsAcademicAndDiscussionSources(t *testing.T) {
+	classifier := &staticTextModel{text: `{
+		"should_search": true,
+		"intent": "framework_comparison",
+		"reason": "Needs benchmark evidence and community feedback.",
+		"sources": ["web", "academic", "discussions"],
+		"need_weather": false,
+		"need_stock": false,
+		"need_calc": true
+	}`}
+	agent := SearchAgent{
+		ClassifierModel: classifier,
+		SearchProvider:  &fakeSearchProvider{},
+	}
+	got := agent.classify(context.Background(), SearchAgentRequest{
+		Query:   "Compare LangGraph AutoGen CrewAI benchmarks and community feedback",
+		Mode:    ModeBalanced,
+		Sources: []SearchSource{SearchSourceWeb},
+	})
+	if !hasSource(got.Sources, SearchSourceAcademic) || !hasSource(got.Sources, SearchSourceDiscussions) {
+		t.Fatalf("sources = %#v, want academic and discussions", got.Sources)
+	}
+	if !got.NeedCalc {
+		t.Fatalf("NeedCalc = false, want true from classifier")
+	}
+}
+
+func TestLLMClassifierFallsBackOnInvalidJSON(t *testing.T) {
+	agent := SearchAgent{ClassifierModel: &staticTextModel{text: "not json"}}
+	got := agent.classify(context.Background(), SearchAgentRequest{
+		Query: "hello",
+		Mode:  ModeBalanced,
+	})
+	if got.ShouldSearch {
+		t.Fatalf("ShouldSearch = true, want heuristic conversational fallback")
+	}
+}
+
+type staticTextModel struct {
+	text string
+}
+
+func (m *staticTextModel) Info() model.Info { return model.Info{Name: "static"} }
+
+func (m *staticTextModel) GenerateContent(_ context.Context, req *model.Request) (<-chan *model.Response, error) {
+	if req == nil || len(req.Messages) == 0 {
+		panic("classifier request missing messages")
+	}
+	if got := req.GenerationConfig.Stream; got {
+		panic("classifier should not stream")
+	}
+	if !strings.Contains(req.Messages[0].Content, "search intent classifier") {
+		panic("classifier system prompt missing")
+	}
+	out := make(chan *model.Response, 1)
+	out <- &model.Response{
+		Object:    model.ObjectTypeChatCompletion,
+		Timestamp: time.Now(),
+		Done:      true,
+		Choices: []model.Choice{{
+			Message: model.Message{Role: model.RoleAssistant, Content: m.text},
+		}},
+	}
+	close(out)
+	return out, nil
 }
