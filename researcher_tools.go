@@ -590,6 +590,9 @@ func emitQueryPipelineEvent(ctx context.Context, handler func(context.Context, S
 }
 
 func (r Researcher) repairSearchQueries(ctx context.Context, req ResearchRequest, source SearchSource, queries []string) []string {
+	if hasAllowedEnglishTechnicalSearchQueries(req, queries) {
+		return preserveSearchQueryLanguage(req, queries)
+	}
 	if r.ResearchModel == nil || source == SearchSourceUploads || !needsQueryRepair(queries) {
 		return preserveSearchQueryLanguage(req, queries)
 	}
@@ -732,10 +735,20 @@ func allowsEnglishTechnicalSearch(req ResearchRequest, query string) bool {
 	return containsAnyTerm(contextText, technicalEnglishSearchAnchors())
 }
 
+func hasAllowedEnglishTechnicalSearchQueries(req ResearchRequest, queries []string) bool {
+	for _, query := range queries {
+		if allowsEnglishTechnicalSearch(req, query) {
+			return true
+		}
+	}
+	return false
+}
+
 func technicalEnglishSearchAnchors() []string {
 	return []string{
 		"winml",
 		"windows ml",
+		"windows-ml",
 		"windows machine learning",
 		"directml",
 		"onnx",

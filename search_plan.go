@@ -527,11 +527,21 @@ func shouldReplaceWithPlannedQueries(plan *SearchPlan, source SearchSource, quer
 		return false
 	}
 	for _, query := range queries {
+		if usefulTechnicalToolQuery(plan, query) {
+			continue
+		}
 		if looksLikeDegenerateSearchQuery(query) || hasTaskLanguage(query) || looksLikeVerboseSearchQuery(query) {
 			return true
 		}
 	}
 	return false
+}
+
+func usefulTechnicalToolQuery(plan *SearchPlan, query string) bool {
+	if plan == nil {
+		return false
+	}
+	return allowsEnglishTechnicalPlanQuery("", *plan, query)
 }
 
 func cleanTaskQueries(queries []string, now time.Time) []string {

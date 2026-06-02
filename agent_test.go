@@ -1057,6 +1057,98 @@ func TestChineseTechnicalSearchAllowsEnglishEntityQueries(t *testing.T) {
 	}
 }
 
+func TestChineseTechnicalSearchKeepsOfficialSiteQueries(t *testing.T) {
+	searcher := &recordingSearchProvider{}
+	plan := &SearchPlan{
+		AnswerGoal: "\u89e3\u91ca\u5fae\u8f6fWinML\u7684\u5b9a\u4e49\u3001API\u3001ONNX\u63a8\u7406\u548c\u786c\u4ef6\u52a0\u901f",
+		Topic:      "\u5fae\u8f6f WinML",
+		Queries: []PlannedSearchQuery{
+			{Query: "WinML API reference Microsoft", Source: SearchSourceWeb, Priority: 1},
+			{Query: "WinML Windows Machine Learning official documentation", Source: SearchSourceWeb, Priority: 2},
+		},
+	}
+	toolQueries := []string{
+		"Windows ML API reference site:learn.microsoft.com",
+		"WinML ONNX runtime inference site:github.com/microsoft/Windows-ML",
+		"Windows Machine Learning hardware acceleration NPU GPU CPU",
+	}
+	researchModel := &scriptedResearchModel{calls: [][]model.ToolCall{
+		{toolCall("search-1", "web_search", map[string]any{"queries": toolQueries})},
+		{toolCall("done-1", "done", map[string]any{})},
+	}}
+	researcher := Researcher{ResearchModel: researchModel, SearchProvider: searcher}
+	_, err := researcher.Research(context.Background(), ResearchRequest{
+		Query: "\u4e3a\u6211\u4ecb\u7ecd\u4e00\u4e0b\u4ec0\u4e48\u662f\u5fae\u8f6f\u7684WinML",
+		Classification: Classification{
+			ShouldSearch:       true,
+			StandaloneFollowUp: "\u4e3a\u6211\u4ecb\u7ecd\u4e00\u4e0b\u4ec0\u4e48\u662f\u5fae\u8f6f\u7684WinML",
+			SearchPlan:         plan,
+			Sources:            []SearchSource{SearchSourceWeb},
+		},
+		SearchPlan: plan,
+		Mode:       ModeQuality,
+		Sources:    []SearchSource{SearchSourceWeb},
+	})
+	if err != nil {
+		t.Fatalf("Research: %v", err)
+	}
+	if !sameStringSet(searcher.queries, toolQueries) {
+		t.Fatalf("queries=%#v, want tool site queries %#v", searcher.queries, toolQueries)
+	}
+}
+
+func TestChineseTechnicalSearchDoesNotRepairPlanBackToChinese(t *testing.T) {
+	searcher := &recordingSearchProvider{}
+	plan := &SearchPlan{
+		AnswerGoal: "\u89e3\u91ca\u5fae\u8f6fWinML\u7684\u5b9a\u4e49\u3001API\u3001ONNX\u63a8\u7406\u548c\u786c\u4ef6\u52a0\u901f",
+		Topic:      "\u5fae\u8f6f WinML",
+		Queries: []PlannedSearchQuery{
+			{Query: "WinML API reference Microsoft", Source: SearchSourceWeb, Priority: 1},
+			{Query: "WinML Windows Machine Learning official documentation", Source: SearchSourceWeb, Priority: 2},
+			{Query: "WinML ONNX model inference Windows", Source: SearchSourceWeb, Priority: 3},
+			{Query: "\u5fae\u8f6f WinML \u4ecb\u7ecd", Source: SearchSourceWeb, Priority: 4},
+		},
+	}
+	researchModel := &scriptedResearchModel{
+		queryRepair: []string{
+			"\u5fae\u8f6f WinML",
+			"WinML Windows \u673a\u5668\u5b66\u4e60 API",
+			"WinML \u5b98\u65b9\u6587\u6863 \u529f\u80fd",
+		},
+		calls: [][]model.ToolCall{
+			{toolCall("search-1", "web_search", map[string]any{"queries": []string{"\u4e3a\u6211\u4ecb\u7ecd\u4e00\u4e0b\u4ec0\u4e48\u662f\u5fae\u8f6f\u7684WinML"}})},
+			{toolCall("done-1", "done", map[string]any{})},
+		},
+	}
+	researcher := Researcher{ResearchModel: researchModel, SearchProvider: searcher}
+	_, err := researcher.Research(context.Background(), ResearchRequest{
+		Query: "\u4e3a\u6211\u4ecb\u7ecd\u4e00\u4e0b\u4ec0\u4e48\u662f\u5fae\u8f6f\u7684WinML",
+		Classification: Classification{
+			ShouldSearch:       true,
+			StandaloneFollowUp: "\u4e3a\u6211\u4ecb\u7ecd\u4e00\u4e0b\u4ec0\u4e48\u662f\u5fae\u8f6f\u7684WinML",
+			SearchPlan:         plan,
+			Sources:            []SearchSource{SearchSourceWeb},
+		},
+		SearchPlan: plan,
+		Mode:       ModeQuality,
+		Sources:    []SearchSource{SearchSourceWeb},
+	})
+	if err != nil {
+		t.Fatalf("Research: %v", err)
+	}
+	want := []string{
+		"WinML API reference Microsoft",
+		"WinML Windows Machine Learning official documentation",
+		"WinML ONNX model inference Windows",
+	}
+	if !sameStringSet(searcher.queries, want) {
+		t.Fatalf("queries=%#v, want unrepaired technical plan queries %#v", searcher.queries, want)
+	}
+	if countResearchRequestsContaining(researchModel.requests, "search query repairer") != 0 {
+		t.Fatalf("technical plan queries should not invoke repairer")
+	}
+}
+
 func TestFinalTechnicalResultsFilterLowValueSearchPages(t *testing.T) {
 	req := ResearchRequest{
 		Query: "\u4e3a\u6211\u4ecb\u7ecd\u4e00\u4e0b\u4ec0\u4e48\u662f\u5fae\u8f6f\u7684WinML",
@@ -1554,6 +1646,23 @@ func countResearchRequestsContaining(requests []*model.Request, needle string) i
 		}
 	}
 	return count
+}
+
+func sameStringSet(left []string, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	counts := map[string]int{}
+	for _, item := range left {
+		counts[item]++
+	}
+	for _, item := range right {
+		counts[item]--
+		if counts[item] < 0 {
+			return false
+		}
+	}
+	return true
 }
 
 func requestContainsContent(req *model.Request, needle string) bool {
