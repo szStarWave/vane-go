@@ -773,8 +773,49 @@ func TestSearchPlannerFallbackForChineseIntroQuestion(t *testing.T) {
 		if looksLikeDegenerateSearchQuery(item.Query) || hasTaskLanguage(item.Query) {
 			t.Fatalf("query = %q, leaked task language; plan=%#v", item.Query, plan)
 		}
+		lowerQuery := strings.ToLower(item.Query)
+		if !strings.Contains(lowerQuery, "winml") {
+			t.Fatalf("query = %q, want WinML topic; plan=%#v", item.Query, plan)
+		}
+		if !containsCJK(item.Query) && !containsAnyFold(item.Query, "microsoft", "windows machine learning", "onnx", "directml") {
+			t.Fatalf("query = %q, want official technical WinML query; plan=%#v", item.Query, plan)
+		}
+	}
+	return
+	for _, item := range plan.Queries {
+		if looksLikeDegenerateSearchQuery(item.Query) || hasTaskLanguage(item.Query) {
+			t.Fatalf("query = %q, leaked task language; plan=%#v", item.Query, plan)
+		}
 		if !strings.Contains(item.Query, "微软") || !strings.Contains(strings.ToLower(item.Query), "winml") {
 			t.Fatalf("query = %q, want Microsoft WinML topic; plan=%#v", item.Query, plan)
+		}
+	}
+}
+
+func TestSearchPlannerPrioritizesEnglishTechnicalQueriesForChineseWinMLPlan(t *testing.T) {
+	rawQuery := "\u4e3a\u6211\u4ecb\u7ecd\u4e00\u4e0b\u4ec0\u4e48\u662f\u5fae\u8f6f\u7684WinML"
+	plan := normalizeSearchPlan(SearchPlan{
+		AnswerGoal: "\u6e05\u6670\u89e3\u91ca\u5fae\u8f6fWinML\u7684\u5b9a\u4e49\u3001\u6838\u5fc3\u529f\u80fd\u3001\u6280\u672f\u67b6\u6784\u3001\u9002\u7528\u573a\u666f\u53ca\u5176\u5728Windows\u751f\u6001\u4e2d\u7684\u89d2\u8272",
+		Topic:      "\u5fae\u8f6f WinML \u6280\u672f",
+		Language:   "zh",
+		Queries: []PlannedSearchQuery{
+			{Query: "\u5fae\u8f6f WinML \u5b9a\u4e49 \u6982\u8ff0", Source: SearchSourceWeb, Priority: 1},
+			{Query: "WinML \u6280\u672f\u67b6\u6784 \u5de5\u4f5c\u539f\u7406", Source: SearchSourceWeb, Priority: 2},
+			{Query: "WinML \u5e94\u7528\u573a\u666f \u6848\u4f8b", Source: SearchSourceWeb, Priority: 3},
+		},
+	}, rawQuery, Classification{ShouldSearch: true}, ModeQuality, []SearchSource{SearchSourceWeb}, time.Date(2026, 6, 2, 10, 0, 0, 0, time.FixedZone("CST", 8*60*60)))
+
+	want := []string{
+		"WinML API reference Microsoft",
+		"WinML Windows Machine Learning official documentation",
+		"WinML ONNX model inference Windows",
+	}
+	if len(plan.Queries) < len(want) {
+		t.Fatalf("queries=%#v, want technical query overrides", plan.Queries)
+	}
+	for i, query := range want {
+		if plan.Queries[i].Query != query {
+			t.Fatalf("query[%d]=%q, want %q; all=%#v", i, plan.Queries[i].Query, query, plan.Queries)
 		}
 	}
 }

@@ -201,6 +201,7 @@ func normalizeSearchPlan(plan SearchPlan, rawQuery string, classification Classi
 			break
 		}
 	}
+	out = prioritizeTechnicalPlanQueries(rawQuery, plan, out, limit, allowedSources, seen)
 	plan.Queries = out
 	if len(plan.ReportSections) == 0 && looksLikeReportGoal(plan.AnswerGoal+" "+rawQuery) {
 		plan.ReportSections = defaultReportSections(rawQuery)
@@ -218,6 +219,109 @@ func allowsEnglishTechnicalPlanQuery(rawQuery string, plan SearchPlan, query str
 	}
 	contextText := strings.ToLower(rawQuery + "\n" + plan.Topic + "\n" + plan.AnswerGoal)
 	return containsAnyTerm(contextText, technicalEnglishSearchAnchors())
+}
+
+func prioritizeTechnicalPlanQueries(rawQuery string, plan SearchPlan, queries []PlannedSearchQuery, limit int, allowedSources []SearchSource, seen map[string]bool) []PlannedSearchQuery {
+	overrides := technicalPlanQueryOverrides(rawQuery, plan)
+	if len(overrides) == 0 {
+		return queries
+	}
+	capacity := len(overrides) + len(queries)
+	if limit > 0 && capacity > limit {
+		capacity = limit
+	}
+	out := make([]PlannedSearchQuery, 0, capacity)
+	for _, item := range overrides {
+		source := item.Source
+		if source == "" || !hasSource(allowedSources, source) {
+			source = SearchSourceWeb
+		}
+		query := strings.TrimSpace(item.Query)
+		if query == "" {
+			continue
+		}
+		key := string(source) + "\x00" + strings.ToLower(query)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		item.Query = query
+		item.Source = source
+		if item.Priority <= 0 {
+			item.Priority = len(out) + 1
+		}
+		out = append(out, item)
+		if len(out) >= limit {
+			return out
+		}
+	}
+	for _, item := range queries {
+		out = append(out, item)
+		if len(out) >= limit {
+			return out
+		}
+	}
+	return out
+}
+
+func technicalPlanQueryOverrides(rawQuery string, plan SearchPlan) []PlannedSearchQuery {
+	context := strings.ToLower(strings.Join(append([]string{
+		rawQuery,
+		plan.Topic,
+		plan.AnswerGoal,
+	}, searchPlanQueries(&plan)...), "\n"))
+	var queries []string
+	add := func(items ...string) {
+		for _, item := range items {
+			item = strings.TrimSpace(item)
+			if item != "" {
+				queries = append(queries, item)
+			}
+		}
+	}
+	if containsAnyTerm(context, []string{"winml", "windows ml", "windows machine learning"}) {
+		add(
+			"WinML API reference Microsoft",
+			"WinML Windows Machine Learning official documentation",
+			"WinML ONNX model inference Windows",
+			"WinML DirectML GPU acceleration",
+		)
+	} else {
+		if containsAnyTerm(context, []string{"onnx", "onnx runtime"}) {
+			add(
+				"ONNX Runtime official documentation",
+				"ONNX Runtime API reference",
+				"ONNX model inference Windows",
+			)
+		}
+		if containsAnyTerm(context, []string{"directml"}) {
+			add(
+				"DirectML Microsoft Learn",
+				"DirectML API reference Microsoft",
+				"DirectML GPU acceleration ONNX Runtime",
+			)
+		}
+		if containsAnyTerm(context, []string{"openvino"}) {
+			add("OpenVINO official documentation", "OpenVINO API reference", "OpenVINO model inference")
+		}
+		if containsAnyTerm(context, []string{"cuda"}) {
+			add("CUDA official documentation", "CUDA API reference", "CUDA GPU acceleration")
+		}
+		if containsAnyTerm(context, []string{"rocm"}) {
+			add("ROCm official documentation", "ROCm API reference", "ROCm GPU acceleration")
+		}
+	}
+	queries = uniqueStrings(queries)
+	out := make([]PlannedSearchQuery, 0, len(queries))
+	for i, query := range queries {
+		out = append(out, PlannedSearchQuery{
+			Query:    query,
+			Purpose:  "official technical source",
+			Source:   SearchSourceWeb,
+			Priority: i + 1,
+		})
+	}
+	return out
 }
 
 func fallbackSearchPlanForQuery(query string, classification Classification, mode Mode, sources []SearchSource, now time.Time) SearchPlan {
