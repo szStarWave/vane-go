@@ -176,6 +176,9 @@ func normalizeSearchPlan(plan SearchPlan, rawQuery string, classification Classi
 		if query == "" {
 			continue
 		}
+		if looksLikeDegenerateSearchQuery(query) {
+			continue
+		}
 		if containsCJK(rawQuery) && !queryLanguageExplicitlyAllowsEnglish(rawQuery) && !containsCJK(query) {
 			continue
 		}
@@ -273,7 +276,9 @@ func cleanSearchTaskQuery(query string, now time.Time) string {
 		return ""
 	}
 	replacements := []string{
-		"请帮我", "", "帮我", "", "帮忙", "", "麻烦", "",
+		"请帮我", "", "为我", "", "帮我", "", "帮忙", "", "请问", "", "请", "", "麻烦", "",
+		"介绍一下", "", "介绍-下", "", "介绍下", "", "介绍", "", "讲一下", "", "说一下", "",
+		"什么是", "", "什么叫", "", "是啥", "",
 		"给我生成", "", "生成一份", "", "生成一个", "", "生成", "",
 		"写一份", "", "写一个", "", "写篇", "",
 		"分析一下", "", "分析下", "",
@@ -293,9 +298,26 @@ func cleanSearchTaskQuery(query string, now time.Time) string {
 
 func hasTaskLanguage(query string) bool {
 	return containsAnyFold(query,
-		"帮我", "请帮", "给我", "生成", "写一份", "写一个", "分析一下", "分析报告", "研究报告", "行业报告",
+		"为我", "帮我", "请帮", "请问", "给我", "介绍一下", "介绍下", "什么是", "什么叫", "生成", "写一份", "写一个", "分析一下", "分析报告", "研究报告", "行业报告",
 		"help me", "please", "generate", "write a", "analysis report",
 	)
+}
+
+func looksLikeDegenerateSearchQuery(query string) bool {
+	query = strings.TrimSpace(query)
+	if query == "" {
+		return true
+	}
+	runes := []rune(query)
+	if len(runes) == 1 && containsCJK(query) {
+		return true
+	}
+	switch strings.ToLower(query) {
+	case "为", "我", "请", "帮", "搜", "查", "看", "下", "为我", "帮我", "请问", "介绍", "分析", "一下":
+		return true
+	default:
+		return false
+	}
 }
 
 func looksLikeReportGoal(query string) bool {
@@ -389,7 +411,7 @@ func shouldReplaceWithPlannedQueries(plan *SearchPlan, source SearchSource, quer
 		return false
 	}
 	for _, query := range queries {
-		if hasTaskLanguage(query) || looksLikeVerboseSearchQuery(query) {
+		if looksLikeDegenerateSearchQuery(query) || hasTaskLanguage(query) || looksLikeVerboseSearchQuery(query) {
 			return true
 		}
 	}

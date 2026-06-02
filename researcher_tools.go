@@ -483,7 +483,6 @@ func (r Researcher) executeQueries(ctx context.Context, req ResearchRequest, sou
 	} else if shouldReplaceWithPlannedQueries(req.SearchPlan, source, queries) {
 		queries = plannedQueriesForSource(req.SearchPlan, source)
 	}
-	queries = cleanTaskQueries(queries, req.Now)
 	queries = uniqueStrings(queries)
 	queries = r.repairSearchQueries(ctx, req, source, queries)
 	queries = cleanTaskQueries(queries, req.Now)

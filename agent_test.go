@@ -758,6 +758,65 @@ func TestSearchPlannerFallbackForChineseReportGoal(t *testing.T) {
 	}
 }
 
+func TestSearchPlannerFallbackForChineseIntroQuestion(t *testing.T) {
+	plan := fallbackSearchPlanForQuery(
+		"为我介绍-下什么是微软的WinML?",
+		Classification{ShouldSearch: true, StandaloneFollowUp: "为我介绍-下什么是微软的WinML?"},
+		ModeBalanced,
+		[]SearchSource{SearchSourceWeb},
+		time.Date(2026, 6, 2, 10, 0, 0, 0, time.FixedZone("CST", 8*60*60)),
+	)
+	if len(plan.Queries) == 0 {
+		t.Fatalf("queries = %#v, want fallback queries", plan.Queries)
+	}
+	for _, item := range plan.Queries {
+		if looksLikeDegenerateSearchQuery(item.Query) || hasTaskLanguage(item.Query) {
+			t.Fatalf("query = %q, leaked task language; plan=%#v", item.Query, plan)
+		}
+		if !strings.Contains(item.Query, "微软") || !strings.Contains(strings.ToLower(item.Query), "winml") {
+			t.Fatalf("query = %q, want Microsoft WinML topic; plan=%#v", item.Query, plan)
+		}
+	}
+}
+
+func TestResearcherReplacesDegenerateToolQueryWithSearchPlan(t *testing.T) {
+	searcher := &recordingSearchProvider{}
+	plan := &SearchPlan{Queries: []PlannedSearchQuery{
+		{Query: "微软 WinML Windows ML", Source: SearchSourceWeb, Priority: 1},
+		{Query: "WinML Windows Machine Learning", Source: SearchSourceWeb, Priority: 2},
+	}}
+	researchModel := &scriptedResearchModel{
+		calls: [][]model.ToolCall{
+			{toolCall("search-1", "web_search", map[string]any{"queries": []string{"为"}})},
+			{toolCall("done-1", "done", map[string]any{})},
+		},
+	}
+	researcher := Researcher{ResearchModel: researchModel, SearchProvider: searcher}
+	_, err := researcher.Research(context.Background(), ResearchRequest{
+		Query: "为我介绍-下什么是微软的WinML?",
+		Classification: Classification{
+			ShouldSearch:       true,
+			StandaloneFollowUp: "为我介绍-下什么是微软的WinML?",
+			SearchPlan:         plan,
+			Sources:            []SearchSource{SearchSourceWeb},
+		},
+		SearchPlan: plan,
+		Mode:       ModeBalanced,
+		Sources:    []SearchSource{SearchSourceWeb},
+	})
+	if err != nil {
+		t.Fatalf("Research: %v", err)
+	}
+	if len(searcher.queries) != 1 {
+		t.Fatalf("queries=%#v, want Chinese-compatible planned query", searcher.queries)
+	}
+	for _, query := range searcher.queries {
+		if looksLikeDegenerateSearchQuery(query) {
+			t.Fatalf("query = %q, want planned query; all=%#v", query, searcher.queries)
+		}
+	}
+}
+
 func TestDeterministicResearchUsesSearchPlanQueries(t *testing.T) {
 	searcher := &recordingSearchProvider{}
 	plan := &SearchPlan{Queries: []PlannedSearchQuery{
@@ -1188,12 +1247,15 @@ type staticTextModel struct {
 }
 
 type recordingSearchProvider struct {
+	mu      sync.Mutex
 	queries []string
 	content string
 }
 
 func (p *recordingSearchProvider) Search(_ context.Context, query string, _ SearchOptions) ([]SearchResult, error) {
+	p.mu.Lock()
 	p.queries = append(p.queries, query)
+	p.mu.Unlock()
 	return []SearchResult{{
 		Title:   "\u54c8\u5c14\u6ee8\u5f3a\u5bf9\u6d41\u5929\u6c14",
 		URL:     "https://example.com/harbin-tornado",
