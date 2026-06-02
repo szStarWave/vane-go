@@ -475,21 +475,38 @@ func actionResultFromSearch(results []SearchResult, err error) researchActionRes
 }
 
 func (r Researcher) executeQueries(ctx context.Context, req ResearchRequest, source SearchSource, queries []string) ([]SearchResult, error) {
+	rawQueries := append([]string(nil), queries...)
 	if len(queries) == 0 {
 		queries = plannedQueriesForSource(req.SearchPlan, source)
 		if len(queries) == 0 {
 			queries = []string{firstNonEmpty(req.Classification.StandaloneFollowUp, req.Query)}
 		}
+		emitQueryPipelineEvent(ctx, r.OnSearchEvent, req, source, "seed_queries", rawQueries, queries, "empty tool queries")
 	} else if shouldReplaceWithPlannedQueries(req.SearchPlan, source, queries) {
+		before := append([]string(nil), queries...)
 		queries = plannedQueriesForSource(req.SearchPlan, source)
+		emitQueryPipelineEvent(ctx, r.OnSearchEvent, req, source, "replace_with_plan", before, queries, "tool queries rejected")
+	} else {
+		emitQueryPipelineEvent(ctx, r.OnSearchEvent, req, source, "tool_queries", rawQueries, queries, "tool supplied queries")
 	}
+	beforeUnique := append([]string(nil), queries...)
 	queries = uniqueStrings(queries)
+	emitQueryPipelineEvent(ctx, r.OnSearchEvent, req, source, "unique", beforeUnique, queries, "")
+	beforeRepair := append([]string(nil), queries...)
 	queries = r.repairSearchQueries(ctx, req, source, queries)
+	emitQueryPipelineEvent(ctx, r.OnSearchEvent, req, source, "repair", beforeRepair, queries, "")
+	beforeClean := append([]string(nil), queries...)
 	queries = cleanTaskQueries(queries, req.Now)
+	emitQueryPipelineEvent(ctx, r.OnSearchEvent, req, source, "clean", beforeClean, queries, "")
+	beforeLanguage := append([]string(nil), queries...)
 	queries = preserveSearchQueryLanguage(req, queries)
+	emitQueryPipelineEvent(ctx, r.OnSearchEvent, req, source, "preserve_language", beforeLanguage, queries, "")
 	if len(queries) > 3 {
+		beforeLimit := append([]string(nil), queries...)
 		queries = queries[:3]
+		emitQueryPipelineEvent(ctx, r.OnSearchEvent, req, source, "limit", beforeLimit, queries, "max 3 queries")
 	}
+	emitQueryPipelineEvent(ctx, r.OnSearchEvent, req, source, "final_websurfx_keys", rawQueries, queries, "queries sent to search provider")
 	var all []SearchResult
 	var firstErr error
 	type queryOutcome struct {
@@ -533,6 +550,23 @@ func (r Researcher) executeQueries(ctx context.Context, req ResearchRequest, sou
 		all = all[:totalResultLimit(req.Mode)]
 	}
 	return all, firstErr
+}
+
+func emitQueryPipelineEvent(ctx context.Context, handler func(context.Context, SearchEvent), req ResearchRequest, source SearchSource, stage string, before []string, after []string, reason string) {
+	emitSearchEvent(ctx, handler, SearchEvent{
+		Type:    SearchEventResearchStep,
+		Mode:    req.Mode,
+		Query:   req.Query,
+		Action:  "query_pipeline",
+		Message: "search query pipeline",
+		Metadata: map[string]any{
+			"stage":  stage,
+			"source": source,
+			"before": append([]string(nil), before...),
+			"after":  append([]string(nil), after...),
+			"reason": reason,
+		},
+	})
 }
 
 func (r Researcher) repairSearchQueries(ctx context.Context, req ResearchRequest, source SearchSource, queries []string) []string {
