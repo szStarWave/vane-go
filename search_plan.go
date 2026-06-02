@@ -63,6 +63,7 @@ Schema:
   "answer_goal": "what the final answer should accomplish",
   "topic": "clean research topic without command phrases",
   "language": "zh|en|other",
+  "entities": ["key exact search entities, especially Latin names/acronyms/products/frameworks"],
   "report_sections": ["optional final-answer sections"],
   "queries": [
     {"query":"short search-engine keyword query","purpose":"why this query is useful","source":"web|academic|discussions|uploads","priority":1}
@@ -74,6 +75,7 @@ Rules:
 - Search queries must be short keywords or focused sub-questions, not the user's full instruction.
 - Remove task phrases such as "help me", "analyze", "generate a report", "write a report", "帮我", "分析一下", "生成", "写一份", "分析报告" from queries.
 - Preserve entities, dates, locations, constraints, and the user's language.
+- Put the main search entities in entities. For Chinese questions about Latin-named products, frameworks, APIs, libraries, models, or standards, keep those Latin entities exactly.
 - If the user asks in Chinese, every query MUST be Chinese unless the user explicitly asks for English/global sources.
 - For analysis/report requests, cover several evidence angles: background, latest developments, data/scale, official or primary sources, impact/risk, and differing views.
 - Return only useful queries. Do not invent sources that are not enabled.`
@@ -100,6 +102,9 @@ type searchPlanJSON struct {
 	AnswerGoalAlt     string   `json:"answerGoal"`
 	Topic             string   `json:"topic"`
 	Language          string   `json:"language"`
+	Entities          []string `json:"entities"`
+	EntitiesAlt       []string `json:"search_entities"`
+	EntitiesCamel     []string `json:"searchEntities"`
 	ReportSections    []string `json:"report_sections"`
 	ReportSectionsAlt []string `json:"reportSections"`
 	Queries           []struct {
@@ -121,6 +126,9 @@ func parseSearchPlanJSON(text string, req SearchAgentRequest, classification Cla
 		Topic:      parsed.Topic,
 		Language:   parsed.Language,
 	}
+	plan.Entities = append(plan.Entities, parsed.Entities...)
+	plan.Entities = append(plan.Entities, parsed.EntitiesAlt...)
+	plan.Entities = append(plan.Entities, parsed.EntitiesCamel...)
 	plan.ReportSections = append(plan.ReportSections, parsed.ReportSections...)
 	plan.ReportSections = append(plan.ReportSections, parsed.ReportSectionsAlt...)
 	for _, item := range parsed.Queries {
@@ -168,6 +176,12 @@ func normalizeSearchPlan(plan SearchPlan, rawQuery string, classification Classi
 			plan.Language = "en"
 		}
 	}
+	entityContext := strings.Join(append([]string{
+		rawQuery,
+		plan.Topic,
+		plan.AnswerGoal,
+	}, searchPlanQueries(&plan)...), "\n")
+	plan.Entities = normalizeSearchEntities(append(plan.Entities, sourcePlanEntities(entityContext)...))
 	limit := plannedQueryLimit(mode)
 	var out []PlannedSearchQuery
 	seen := map[string]bool{}
@@ -215,7 +229,7 @@ func allowsEnglishTechnicalPlanQuery(rawQuery string, plan SearchPlan, query str
 		plan.Topic,
 		plan.AnswerGoal,
 	}, searchPlanQueries(&plan)...), "\n")
-	return allowsEnglishSourceQuery(contextText, query)
+	return allowsEnglishSourceQueryForEntities(plan.Entities, contextText, query)
 }
 
 func prioritizeTechnicalPlanQueries(rawQuery string, plan SearchPlan, queries []PlannedSearchQuery, limit int, allowedSources []SearchSource, seen map[string]bool) []PlannedSearchQuery {
@@ -271,7 +285,7 @@ func technicalPlanQueryOverrides(rawQuery string, plan SearchPlan) []PlannedSear
 		return nil
 	}
 	var queries []string
-	for _, entity := range sourcePlanEntities(context) {
+	for _, entity := range firstNonEmptySearchEntities(plan.Entities, sourcePlanEntities(context)) {
 		queries = append(queries,
 			entity+" official documentation",
 			entity+" API reference",
@@ -295,6 +309,35 @@ func technicalPlanQueryOverrides(rawQuery string, plan SearchPlan) []PlannedSear
 		})
 	}
 	return out
+}
+
+func normalizeSearchEntities(entities []string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, entity := range entities {
+		entity = strings.TrimSpace(entity)
+		entity = strings.Trim(entity, ".,;:()[]{}<>\"'")
+		if entity == "" || containsCJK(entity) || isSourceQueryIntentTerm(strings.ToLower(entity)) {
+			continue
+		}
+		key := strings.ToLower(entity)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, entity)
+		if len(out) >= 8 {
+			break
+		}
+	}
+	return out
+}
+
+func firstNonEmptySearchEntities(primary []string, fallback []string) []string {
+	if len(primary) > 0 {
+		return primary
+	}
+	return fallback
 }
 
 func needsOfficialSourcePlan(context string) bool {
@@ -573,6 +616,15 @@ func formatSearchPlanForResearch(plan *SearchPlan) string {
 	}
 	if strings.TrimSpace(plan.Language) != "" {
 		fmt.Fprintf(&b, "<language>%s</language>\n", xmlishEscape(plan.Language))
+	}
+	if len(plan.Entities) > 0 {
+		b.WriteString("<entities>")
+		for _, entity := range plan.Entities {
+			if strings.TrimSpace(entity) != "" {
+				fmt.Fprintf(&b, "<entity>%s</entity>", xmlishEscape(entity))
+			}
+		}
+		b.WriteString("</entities>\n")
 	}
 	for _, item := range plan.Queries {
 		if strings.TrimSpace(item.Query) == "" {

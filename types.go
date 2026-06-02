@@ -176,6 +176,7 @@ type SearchPlan struct {
 	AnswerGoal     string               `json:"answer_goal,omitempty"`
 	Topic          string               `json:"topic,omitempty"`
 	Language       string               `json:"language,omitempty"`
+	Entities       []string             `json:"entities,omitempty"`
 	Queries        []PlannedSearchQuery `json:"queries,omitempty"`
 	ReportSections []string             `json:"report_sections,omitempty"`
 }

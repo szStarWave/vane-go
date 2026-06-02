@@ -725,7 +725,7 @@ func allowsEnglishTechnicalSearch(req ResearchRequest, query string) bool {
 		[]string{req.Query, req.Classification.StandaloneFollowUp},
 		searchPlanQueries(req.SearchPlan)...,
 	), "\n")
-	return allowsEnglishSourceQuery(contextText, query)
+	return allowsEnglishSourceQueryForEntities(searchPlanEntities(req.SearchPlan), contextText, query)
 }
 
 func hasAllowedEnglishTechnicalSearchQueries(req ResearchRequest, queries []string) bool {
@@ -977,15 +977,47 @@ func shouldApplySourceAwareRanking(queries []string) bool {
 }
 
 func allowsEnglishSourceQuery(contextText string, query string) bool {
+	return allowsEnglishSourceQueryForEntities(sourcePlanEntities(contextText), contextText, query)
+}
+
+func allowsEnglishSourceQueryForEntities(entities []string, contextText string, query string) bool {
 	query = strings.TrimSpace(query)
 	if query == "" || containsCJK(query) {
 		return false
 	}
-	if !sharesLatinEntityTerm(contextText, query) {
+	entities = normalizeSearchEntities(entities)
+	if len(entities) > 0 {
+		if !querySharesSearchEntity(entities, query) {
+			return false
+		}
+	} else if !sharesLatinEntityTerm(contextText, query) {
 		return false
 	}
 	lower := strings.ToLower(query)
 	return hasSearchOperatorOrDomainConstraint(lower) || hasSourceQueryIntent(lower) || hasTechnicalInfoIntent(lower)
+}
+
+func searchPlanEntities(plan *SearchPlan) []string {
+	if plan == nil {
+		return nil
+	}
+	return plan.Entities
+}
+
+func querySharesSearchEntity(entities []string, query string) bool {
+	queryTerms := latinEntityTermSet(query)
+	for _, entity := range entities {
+		entityTerms := latinEntityTermSet(entity)
+		if len(entityTerms) == 0 {
+			entityTerms = map[string]bool{strings.ToLower(entity): true}
+		}
+		for term := range entityTerms {
+			if queryTerms[term] {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func sharesLatinEntityTerm(left string, right string) bool {
