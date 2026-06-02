@@ -631,7 +631,7 @@ func TestQualityEventResultsFilterGenericSources(t *testing.T) {
 			Content: "A language article about Harbin spelling.",
 		},
 	}
-	got := filterQualityResults(queries, results)
+	got := filterQualityResults(queries, nil, results)
 	if len(got) != 1 {
 		t.Fatalf("filtered len = %d, want 1: %#v", len(got), got)
 	}
@@ -921,7 +921,7 @@ func TestResearcherLexicalRankingFiltersOffTopicTechnicalResults(t *testing.T) {
 		},
 	}
 
-	ranked := researcher.rankAndDedupe(context.Background(), queries, results, ModeBalanced)
+	ranked := researcher.rankAndDedupe(context.Background(), queries, []string{"WinML"}, results, ModeBalanced)
 	if len(ranked) != 2 {
 		t.Fatalf("ranked results = %#v, want only WinML-related results", ranked)
 	}
@@ -1152,7 +1152,7 @@ func TestChineseTechnicalSearchDoesNotRepairPlanBackToChinese(t *testing.T) {
 func TestFinalTechnicalResultsFilterLowValueSearchPages(t *testing.T) {
 	req := ResearchRequest{
 		Query: "\u4e3a\u6211\u4ecb\u7ecd\u4e00\u4e0b\u4ec0\u4e48\u662f\u5fae\u8f6f\u7684WinML",
-		SearchPlan: &SearchPlan{Queries: []PlannedSearchQuery{
+		SearchPlan: &SearchPlan{Entities: []string{"WinML"}, Queries: []PlannedSearchQuery{
 			{Query: "WinML API reference Microsoft", Source: SearchSourceWeb},
 			{Query: "WinML ONNX model inference Windows", Source: SearchSourceWeb},
 		}},
@@ -1191,6 +1191,68 @@ func TestFinalTechnicalResultsFilterLowValueSearchPages(t *testing.T) {
 	}
 	if !strings.Contains(ranked[0].URL, "learn.microsoft.com") && !strings.Contains(ranked[0].URL, "github.com/microsoft") {
 		t.Fatalf("top result = %#v, want official technical source", ranked[0])
+	}
+}
+
+func TestFinalTechnicalResultsRequirePrimaryEntityMatch(t *testing.T) {
+	req := ResearchRequest{
+		Query: "\u4e3a\u6211\u4ecb\u7ecd\u4e00\u4e0b\u4ec0\u4e48\u662f\u5fae\u8f6f\u7684WinML",
+		SearchPlan: &SearchPlan{Queries: []PlannedSearchQuery{
+			{Query: "WinML API reference Microsoft", Source: SearchSourceWeb},
+			{Query: "WinML ONNX model inference Windows", Source: SearchSourceWeb},
+		}, Entities: []string{"WinML"}},
+	}
+	ranked := rankFinalResearchResults(req, []SearchResult{
+		{
+			Title:   "Download Windows 11",
+			URL:     "https://www.microsoft.com/software-download/windows11",
+			Content: "Download the latest Windows installer and media creation tool.",
+		},
+		{
+			Title:   "DiskGenius official download",
+			URL:     "https://www.diskgenius.com/download.php",
+			Content: "Disk partition management and file recovery software.",
+		},
+		{
+			Title:   "Windows app development docs",
+			URL:     "https://learn.microsoft.com/en-us/windows/apps/",
+			Content: "Documentation for Windows application development.",
+		},
+	})
+	if len(ranked) != 0 {
+		t.Fatalf("ranked=%#v, want no sources without WinML primary entity match", ranked)
+	}
+}
+
+func TestQualityDeepReadRequiresPrimaryEntityMatch(t *testing.T) {
+	researcher := Researcher{
+		ScrapeProvider: staticScrapeProvider{content: "DiskGenius partition recovery details."},
+	}
+	req := ResearchRequest{
+		Query: "\u4e3a\u6211\u4ecb\u7ecd\u4e00\u4e0b\u4ec0\u4e48\u662f\u5fae\u8f6f\u7684WinML",
+		Mode:  ModeQuality,
+		SearchPlan: &SearchPlan{
+			Entities: []string{"WinML"},
+			Queries:  []PlannedSearchQuery{{Query: "WinML API reference Microsoft", Source: SearchSourceWeb}},
+		},
+	}
+	results := []SearchResult{
+		{
+			Query:   "WinML API reference Microsoft",
+			Title:   "Download Windows 11",
+			URL:     "https://www.microsoft.com/software-download/windows11",
+			Content: "Download the latest Windows installer.",
+		},
+		{
+			Query:   "WinML API reference Microsoft",
+			Title:   "DiskGenius official download",
+			URL:     "https://www.diskgenius.com/download.php",
+			Content: "Disk partition management and file recovery software.",
+		},
+	}
+	got := researcher.deepReadQuality(context.Background(), req, []string{"WinML API reference Microsoft"}, results)
+	if len(got) != 0 {
+		t.Fatalf("deepReadQuality=%#v, want empty when no source matches primary entity", got)
 	}
 }
 

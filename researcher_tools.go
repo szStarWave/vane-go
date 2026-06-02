@@ -255,6 +255,11 @@ func rankFinalResearchResults(req ResearchRequest, results []SearchResult) []Sea
 	if len(results) == 0 {
 		return nil
 	}
+	entities := searchPlanPrimaryEntities(req.SearchPlan)
+	results = enforcePrimaryEntityResults(entities, results)
+	if len(results) == 0 {
+		return nil
+	}
 	queries := searchPlanQueries(req.SearchPlan)
 	for _, result := range results {
 		if q := strings.TrimSpace(result.Query); q != "" {
@@ -267,7 +272,7 @@ func rankFinalResearchResults(req ResearchRequest, results []SearchResult) []Sea
 	if !shouldApplySourceAwareRanking(queries) {
 		return results
 	}
-	return lexicalRankAndFilterResults(uniqueStrings(queries), results)
+	return lexicalRankAndFilterResults(uniqueStrings(queries), entities, results)
 }
 
 func limitResultsForContext(mode Mode, results []SearchResult) []SearchResult {
@@ -562,7 +567,8 @@ func (r Researcher) executeQueries(ctx context.Context, req ResearchRequest, sou
 		}
 		all = append(all, outcome.results...)
 	}
-	all = r.rankAndDedupe(ctx, queries, all, req.Mode)
+	entities := searchPlanPrimaryEntities(req.SearchPlan)
+	all = r.rankAndDedupe(ctx, queries, entities, all, req.Mode)
 	if req.Mode == ModeQuality && source != SearchSourceUploads {
 		all = r.deepReadQuality(ctx, req, queries, all)
 	}
@@ -828,18 +834,18 @@ func containsAnyFold(value string, needles ...string) bool {
 	return false
 }
 
-func (r Researcher) rankAndDedupe(ctx context.Context, queries []string, results []SearchResult, mode Mode) []SearchResult {
+func (r Researcher) rankAndDedupe(ctx context.Context, queries []string, entities []string, results []SearchResult, mode Mode) []SearchResult {
 	if len(results) == 0 {
 		return nil
 	}
 	deduped := dedupeResults(results)
 	if r.TextEmbeddingProvider == nil || mode == ModeQuality {
-		return lexicalRankAndFilterResults(queries, deduped)
+		return lexicalRankAndFilterResults(queries, entities, deduped)
 	}
 	texts := append([]string{strings.Join(queries, "\n")}, resultTexts(results)...)
 	embeddings, err := r.TextEmbeddingProvider.EmbedTexts(ctx, texts)
 	if err != nil || len(embeddings) != len(texts) {
-		return lexicalRankAndFilterResults(queries, deduped)
+		return lexicalRankAndFilterResults(queries, entities, deduped)
 	}
 	queryEmbedding := embeddings[0]
 	type scored struct {
@@ -859,10 +865,14 @@ func (r Researcher) rankAndDedupe(ctx context.Context, queries []string, results
 	for _, item := range scoredResults {
 		ranked = append(ranked, item.result)
 	}
-	return dedupeResults(ranked)
+	return enforcePrimaryEntityResults(entities, dedupeResults(ranked))
 }
 
-func lexicalRankAndFilterResults(queries []string, results []SearchResult) []SearchResult {
+func lexicalRankAndFilterResults(queries []string, entities []string, results []SearchResult) []SearchResult {
+	if len(results) == 0 {
+		return nil
+	}
+	results = enforcePrimaryEntityResults(entities, results)
 	if len(results) == 0 {
 		return nil
 	}
@@ -1002,6 +1012,14 @@ func searchPlanEntities(plan *SearchPlan) []string {
 		return nil
 	}
 	return plan.Entities
+}
+
+func searchPlanPrimaryEntities(plan *SearchPlan) []string {
+	entities := normalizeSearchEntities(searchPlanEntities(plan))
+	if len(entities) == 0 {
+		return nil
+	}
+	return entities[:1]
 }
 
 func querySharesSearchEntity(entities []string, query string) bool {
@@ -1236,17 +1254,69 @@ func isLikelyEntityAnchor(token string) bool {
 }
 
 func queryAnchorAliases(term string) []string {
-	return nil
+	switch strings.ToLower(strings.TrimSpace(term)) {
+	case "winml":
+		return []string{"windows ml", "windowsml", "windows machine learning"}
+	default:
+		return nil
+	}
+}
+
+func enforcePrimaryEntityResults(entities []string, results []SearchResult) []SearchResult {
+	entities = searchEntityNeedles(entities)
+	if len(entities) == 0 {
+		return results
+	}
+	out := make([]SearchResult, 0, len(results))
+	for _, result := range results {
+		if matchesPrimaryEntityNeedles(entities, result) {
+			out = append(out, result)
+		}
+	}
+	return out
+}
+
+func matchesPrimaryEntity(entities []string, result SearchResult) bool {
+	needles := searchEntityNeedles(entities)
+	if len(needles) == 0 {
+		return true
+	}
+	return matchesPrimaryEntityNeedles(needles, result)
+}
+
+func matchesPrimaryEntityNeedles(needles []string, result SearchResult) bool {
+	haystack := resultHaystack(result)
+	for _, needle := range needles {
+		if strings.Contains(haystack, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+func searchEntityNeedles(entities []string) []string {
+	entities = normalizeSearchEntities(entities)
+	seen := map[string]bool{}
+	var out []string
+	for _, entity := range entities {
+		for _, needle := range append([]string{entity}, queryAnchorAliases(entity)...) {
+			needle = strings.ToLower(strings.TrimSpace(needle))
+			if needle == "" || seen[needle] {
+				continue
+			}
+			seen[needle] = true
+			out = append(out, needle)
+		}
+	}
+	return out
 }
 
 func (r Researcher) deepReadQuality(ctx context.Context, req ResearchRequest, queries []string, results []SearchResult) []SearchResult {
 	if r.ScrapeProvider == nil || len(results) == 0 {
 		return results
 	}
-	candidates := filterQualityResults(queries, results)
-	if len(candidates) == 0 {
-		candidates = results
-	}
+	entities := searchPlanPrimaryEntities(req.SearchPlan)
+	candidates := filterQualityResults(queries, entities, results)
 	emitSearchEvent(ctx, r.OnSearchEvent, SearchEvent{
 		Type:    SearchEventResearchStep,
 		Mode:    req.Mode,
@@ -1262,7 +1332,7 @@ func (r Researcher) deepReadQuality(ctx context.Context, req ResearchRequest, qu
 	if len(picked) == 0 {
 		picked = candidates
 	}
-	picked = filterQualityResults(queries, picked)
+	picked = filterQualityResults(queries, entities, picked)
 	if len(picked) == 0 {
 		picked = candidates
 	}
@@ -1294,7 +1364,7 @@ func (r Researcher) deepReadQuality(ctx context.Context, req ResearchRequest, qu
 		if strings.TrimSpace(result.Title) == "" && strings.TrimSpace(result.URL) == "" && strings.TrimSpace(result.Content) == "" {
 			continue
 		}
-		if !qualityResultRelevant(queries, result) {
+		if !qualityResultRelevant(queries, entities, result) {
 			continue
 		}
 		out = append(out, result)
@@ -1359,7 +1429,7 @@ func supplementalQualityResults(queries []string, results []SearchResult, exclud
 		if key == "" || exclude[key] {
 			continue
 		}
-		if !qualitySupplementalRelevant(queries, result) {
+		if !qualitySupplementalRelevant(queries, nil, result) {
 			continue
 		}
 		result.Stage = "supplemental"
@@ -1371,8 +1441,8 @@ func supplementalQualityResults(queries []string, results []SearchResult, exclud
 	return out
 }
 
-func qualitySupplementalRelevant(queries []string, result SearchResult) bool {
-	if !qualityResultRelevant(queries, result) {
+func qualitySupplementalRelevant(queries []string, entities []string, result SearchResult) bool {
+	if !qualityResultRelevant(queries, entities, result) {
 		return false
 	}
 	terms := queryRelevanceTerms(queries)
@@ -1392,17 +1462,20 @@ func qualitySupplementalRelevant(queries []string, result SearchResult) bool {
 	return matches >= 2
 }
 
-func filterQualityResults(queries []string, results []SearchResult) []SearchResult {
+func filterQualityResults(queries []string, entities []string, results []SearchResult) []SearchResult {
 	filtered := make([]SearchResult, 0, len(results))
 	for _, result := range results {
-		if qualityResultRelevant(queries, result) {
+		if qualityResultRelevant(queries, entities, result) {
 			filtered = append(filtered, result)
 		}
 	}
 	return filtered
 }
 
-func qualityResultRelevant(queries []string, result SearchResult) bool {
+func qualityResultRelevant(queries []string, entities []string, result SearchResult) bool {
+	if !matchesPrimaryEntity(entities, result) {
+		return false
+	}
 	eventTerms := queryEventTerms(queries)
 	if len(eventTerms) == 0 {
 		return true
