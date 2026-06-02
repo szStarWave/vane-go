@@ -511,6 +511,9 @@ func (r Researcher) executeQueries(ctx context.Context, req ResearchRequest, sou
 				if results[i].Source == "" {
 					results[i].Source = source
 				}
+				if strings.TrimSpace(results[i].Query) == "" {
+					results[i].Query = q
+				}
 			}
 			outcomes[i] = queryOutcome{results: results, err: err}
 		}()
@@ -752,13 +755,14 @@ func (r Researcher) rankAndDedupe(ctx context.Context, queries []string, results
 	if len(results) == 0 {
 		return nil
 	}
+	deduped := dedupeResults(results)
 	if r.TextEmbeddingProvider == nil || mode == ModeQuality {
-		return dedupeResults(results)
+		return lexicalRankAndFilterResults(queries, deduped)
 	}
 	texts := append([]string{strings.Join(queries, "\n")}, resultTexts(results)...)
 	embeddings, err := r.TextEmbeddingProvider.EmbedTexts(ctx, texts)
 	if err != nil || len(embeddings) != len(texts) {
-		return dedupeResults(results)
+		return lexicalRankAndFilterResults(queries, deduped)
 	}
 	queryEmbedding := embeddings[0]
 	type scored struct {
@@ -779,6 +783,157 @@ func (r Researcher) rankAndDedupe(ctx context.Context, queries []string, results
 		ranked = append(ranked, item.result)
 	}
 	return dedupeResults(ranked)
+}
+
+func lexicalRankAndFilterResults(queries []string, results []SearchResult) []SearchResult {
+	if len(results) == 0 {
+		return nil
+	}
+	anchors := queryAnchorTerms(queries)
+	filtered := make([]SearchResult, 0, len(results))
+	if len(anchors) > 0 {
+		for _, result := range results {
+			if containsAnyTerm(resultHaystack(result), anchors) {
+				filtered = append(filtered, result)
+			}
+		}
+	}
+	if len(filtered) == 0 {
+		filtered = append(filtered, results...)
+	}
+	sort.SliceStable(filtered, func(i, j int) bool {
+		left := lexicalResultScore(queries, anchors, filtered[i])
+		right := lexicalResultScore(queries, anchors, filtered[j])
+		if left == right {
+			return strings.ToLower(filtered[i].Title) < strings.ToLower(filtered[j].Title)
+		}
+		return left > right
+	})
+	return filtered
+}
+
+func lexicalResultScore(queries []string, anchors []string, result SearchResult) int {
+	score := 0
+	title := strings.ToLower(result.Title)
+	content := strings.ToLower(result.Content)
+	rawURL := strings.ToLower(result.URL)
+	for _, term := range anchors {
+		if strings.Contains(title, term) {
+			score += 40
+		}
+		if strings.Contains(rawURL, term) {
+			score += 30
+		}
+		if strings.Contains(content, term) {
+			score += 15
+		}
+	}
+	for _, term := range queryRelevanceTerms(queriesForResult(queries, result)) {
+		if strings.Contains(title, term) {
+			score += 12
+		}
+		if strings.Contains(content, term) {
+			score += 5
+		}
+		if strings.Contains(rawURL, term) {
+			score += 4
+		}
+	}
+	if preferredTechnicalSource(queries, result) {
+		score += 60
+	}
+	return score
+}
+
+func queriesForResult(queries []string, result SearchResult) []string {
+	if strings.TrimSpace(result.Query) != "" {
+		return []string{result.Query}
+	}
+	return queries
+}
+
+func preferredTechnicalSource(queries []string, result SearchResult) bool {
+	queryText := strings.ToLower(strings.Join(queries, "\n"))
+	if !containsAnyTerm(queryText, []string{"winml", "windows ml", "windows machine learning", "directml", "onnx"}) {
+		return false
+	}
+	haystack := strings.ToLower(result.URL + "\n" + result.Title)
+	return containsAnyTerm(haystack, []string{
+		"learn.microsoft.com",
+		"github.com/microsoft",
+		"onnxruntime.ai",
+	})
+}
+
+func queryAnchorTerms(queries []string) []string {
+	seen := map[string]bool{}
+	var anchors []string
+	for _, query := range queries {
+		for _, raw := range asciiQueryTokens(query) {
+			term := strings.ToLower(raw)
+			if seen[term] || !isLikelyEntityAnchor(raw) {
+				continue
+			}
+			seen[term] = true
+			anchors = append(anchors, term)
+			for _, alias := range queryAnchorAliases(term) {
+				if !seen[alias] {
+					seen[alias] = true
+					anchors = append(anchors, alias)
+				}
+			}
+		}
+	}
+	return anchors
+}
+
+func asciiQueryTokens(query string) []string {
+	return strings.FieldsFunc(query, func(r rune) bool {
+		return !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '.' || r == '#' || r == '+')
+	})
+}
+
+func isLikelyEntityAnchor(token string) bool {
+	token = strings.Trim(token, ".#+")
+	if len(token) < 3 {
+		return false
+	}
+	lower := strings.ToLower(token)
+	switch lower {
+	case "winml", "directml", "onnx", "openvino", "cuda", "rocm":
+		return true
+	case "the", "and", "for", "with", "from", "into", "what", "how", "why", "main", "best", "new", "latest", "official", "docs", "example", "examples":
+		return false
+	}
+	hasLetter := false
+	hasLower := false
+	hasUpper := false
+	hasDigit := false
+	for _, r := range token {
+		switch {
+		case r >= 'a' && r <= 'z':
+			hasLetter = true
+			hasLower = true
+		case r >= 'A' && r <= 'Z':
+			hasLetter = true
+			hasUpper = true
+		case r >= '0' && r <= '9':
+			hasDigit = true
+		}
+	}
+	if !hasLetter {
+		return false
+	}
+	return hasDigit || hasUpper || (hasLower && strings.ContainsAny(token, ".#+"))
+}
+
+func queryAnchorAliases(term string) []string {
+	switch term {
+	case "winml":
+		return []string{"windows ml", "windows machine learning"}
+	default:
+		return nil
+	}
 }
 
 func (r Researcher) deepReadQuality(ctx context.Context, req ResearchRequest, queries []string, results []SearchResult) []SearchResult {

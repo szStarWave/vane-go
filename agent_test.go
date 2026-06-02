@@ -849,6 +849,48 @@ func TestDeterministicResearchUsesSearchPlanQueries(t *testing.T) {
 	}
 }
 
+func TestResearcherLexicalRankingFiltersOffTopicTechnicalResults(t *testing.T) {
+	researcher := Researcher{}
+	queries := []string{
+		"WinML main scenarios",
+		"WinML architecture components",
+		"WinML developer docs examples",
+	}
+	results := []SearchResult{
+		{
+			Title:   "Machine learning main scenarios",
+			URL:     "https://example.com/ml-scenarios",
+			Content: "A generic article about machine learning scenarios.",
+			Query:   queries[0],
+		},
+		{
+			Title:   "Windows ML samples and documentation",
+			URL:     "https://learn.microsoft.com/windows/ai/windows-ml/samples",
+			Content: "Windows Machine Learning is also known as WinML.",
+			Query:   queries[2],
+		},
+		{
+			Title:   "Using WinML from C#",
+			URL:     "https://developer.example.com/winml-csharp",
+			Content: "WinML application guidance.",
+			Query:   queries[0],
+		},
+	}
+
+	ranked := researcher.rankAndDedupe(context.Background(), queries, results, ModeBalanced)
+	if len(ranked) != 2 {
+		t.Fatalf("ranked results = %#v, want only WinML-related results", ranked)
+	}
+	if ranked[0].URL != "https://learn.microsoft.com/windows/ai/windows-ml/samples" {
+		t.Fatalf("top result = %#v, want Microsoft documentation first", ranked[0])
+	}
+	for _, result := range ranked {
+		if strings.Contains(result.URL, "ml-scenarios") {
+			t.Fatalf("off-topic result was not filtered: %#v", ranked)
+		}
+	}
+}
+
 func TestChineseSearchQueriesRejectEnglishRepair(t *testing.T) {
 	searcher := &recordingSearchProvider{}
 	researchModel := &scriptedResearchModel{
