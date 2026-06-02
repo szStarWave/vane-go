@@ -234,6 +234,7 @@ func (r Researcher) researchWithTools(ctx context.Context, req ResearchRequest) 
 			break
 		}
 	}
+	out = rankFinalResearchResults(req, out)
 	emitSearchEvent(ctx, r.OnSearchEvent, SearchEvent{
 		Type:        SearchEventEnd,
 		Mode:        req.Mode,
@@ -248,6 +249,25 @@ func (r Researcher) researchWithTools(ctx context.Context, req ResearchRequest) 
 		},
 	})
 	return out, usedTools, firstErr
+}
+
+func rankFinalResearchResults(req ResearchRequest, results []SearchResult) []SearchResult {
+	if len(results) == 0 {
+		return nil
+	}
+	queries := searchPlanQueries(req.SearchPlan)
+	for _, result := range results {
+		if q := strings.TrimSpace(result.Query); q != "" {
+			queries = append(queries, q)
+		}
+	}
+	if len(queries) == 0 {
+		queries = []string{firstNonEmpty(req.Classification.StandaloneFollowUp, req.Query)}
+	}
+	if !containsAnyTerm(strings.ToLower(strings.Join(queries, "\n")), technicalEnglishSearchAnchors()) {
+		return results
+	}
+	return lexicalRankAndFilterResults(uniqueStrings(queries), results)
 }
 
 func limitResultsForContext(mode Mode, results []SearchResult) []SearchResult {
@@ -688,10 +708,42 @@ func queryLanguageCompatible(req ResearchRequest, query string) bool {
 	if !prefersChineseSearch(req) {
 		return true
 	}
+	if allowsEnglishTechnicalSearch(req, query) {
+		return true
+	}
 	return containsCJK(query) || containsAnyFold(query,
 		"site:.cn", "site:gov.cn", "gov.cn",
 		"cctv", "xinhua", "china daily", "people.cn",
 	)
+}
+
+func allowsEnglishTechnicalSearch(req ResearchRequest, query string) bool {
+	if containsCJK(query) {
+		return false
+	}
+	queryText := strings.ToLower(query)
+	if !containsAnyTerm(queryText, technicalEnglishSearchAnchors()) {
+		return false
+	}
+	contextText := strings.ToLower(strings.Join(append(
+		[]string{req.Query, req.Classification.StandaloneFollowUp},
+		searchPlanQueries(req.SearchPlan)...,
+	), "\n"))
+	return containsAnyTerm(contextText, technicalEnglishSearchAnchors())
+}
+
+func technicalEnglishSearchAnchors() []string {
+	return []string{
+		"winml",
+		"windows ml",
+		"windows machine learning",
+		"directml",
+		"onnx",
+		"onnx runtime",
+		"openvino",
+		"cuda",
+		"rocm",
+	}
 }
 
 func prefersChineseSearch(req ResearchRequest) bool {
@@ -827,6 +879,9 @@ func lexicalRankAndFilterResults(queries []string, results []SearchResult) []Sea
 	filtered := make([]SearchResult, 0, len(results))
 	if len(anchors) > 0 {
 		for _, result := range results {
+			if lowValueTechnicalSource(queries, result) {
+				continue
+			}
 			if containsAnyTerm(resultHaystack(result), anchors) {
 				filtered = append(filtered, result)
 			}
@@ -888,7 +943,7 @@ func queriesForResult(queries []string, result SearchResult) []string {
 
 func preferredTechnicalSource(queries []string, result SearchResult) bool {
 	queryText := strings.ToLower(strings.Join(queries, "\n"))
-	if !containsAnyTerm(queryText, []string{"winml", "windows ml", "windows machine learning", "directml", "onnx"}) {
+	if !containsAnyTerm(queryText, technicalEnglishSearchAnchors()) {
 		return false
 	}
 	haystack := strings.ToLower(result.URL + "\n" + result.Title)
@@ -897,6 +952,27 @@ func preferredTechnicalSource(queries []string, result SearchResult) bool {
 		"github.com/microsoft",
 		"onnxruntime.ai",
 	})
+}
+
+func lowValueTechnicalSource(queries []string, result SearchResult) bool {
+	queryText := strings.ToLower(strings.Join(queries, "\n"))
+	if !containsAnyTerm(queryText, technicalEnglishSearchAnchors()) || preferredTechnicalSource(queries, result) {
+		return false
+	}
+	rawURL := strings.ToLower(result.URL)
+	title := strings.ToLower(result.Title)
+	if containsAnyTerm(rawURL, []string{
+		"wenku.so.com/s?",
+		"yasuo.360.cn",
+		"baike.baidu.com",
+		"www.so.com/link",
+	}) {
+		return true
+	}
+	if strings.Contains(title, "360") && strings.Contains(title, "winml") {
+		return true
+	}
+	return false
 }
 
 func queryAnchorTerms(queries []string) []string {

@@ -179,7 +179,7 @@ func normalizeSearchPlan(plan SearchPlan, rawQuery string, classification Classi
 		if looksLikeDegenerateSearchQuery(query) {
 			continue
 		}
-		if containsCJK(rawQuery) && !queryLanguageExplicitlyAllowsEnglish(rawQuery) && !containsCJK(query) {
+		if containsCJK(rawQuery) && !queryLanguageExplicitlyAllowsEnglish(rawQuery) && !containsCJK(query) && !allowsEnglishTechnicalPlanQuery(rawQuery, plan, query) {
 			continue
 		}
 		source := item.Source
@@ -206,6 +206,18 @@ func normalizeSearchPlan(plan SearchPlan, rawQuery string, classification Classi
 		plan.ReportSections = defaultReportSections(rawQuery)
 	}
 	return plan
+}
+
+func allowsEnglishTechnicalPlanQuery(rawQuery string, plan SearchPlan, query string) bool {
+	if containsCJK(query) {
+		return false
+	}
+	queryText := strings.ToLower(query)
+	if !containsAnyTerm(queryText, technicalEnglishSearchAnchors()) {
+		return false
+	}
+	contextText := strings.ToLower(rawQuery + "\n" + plan.Topic + "\n" + plan.AnswerGoal)
+	return containsAnyTerm(contextText, technicalEnglishSearchAnchors())
 }
 
 func fallbackSearchPlanForQuery(query string, classification Classification, mode Mode, sources []SearchSource, now time.Time) SearchPlan {

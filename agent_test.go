@@ -807,12 +807,15 @@ func TestResearcherReplacesDegenerateToolQueryWithSearchPlan(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Research: %v", err)
 	}
-	if len(searcher.queries) != 1 {
-		t.Fatalf("queries=%#v, want Chinese-compatible planned query", searcher.queries)
+	if len(searcher.queries) == 0 {
+		t.Fatalf("queries=%#v, want planned queries", searcher.queries)
 	}
 	for _, query := range searcher.queries {
 		if looksLikeDegenerateSearchQuery(query) {
 			t.Fatalf("query = %q, want planned query; all=%#v", query, searcher.queries)
+		}
+		if !strings.Contains(strings.ToLower(query), "winml") && !strings.Contains(strings.ToLower(query), "windows machine learning") {
+			t.Fatalf("query = %q, want WinML planned query; all=%#v", query, searcher.queries)
 		}
 	}
 }
@@ -967,6 +970,94 @@ func TestChineseSearchQueriesRejectEnglishToolQueries(t *testing.T) {
 		if containsAnyFold(query, "NVIDIA AI PC", "market reaction", "launch feedback") {
 			t.Fatalf("query = %q, leaked English tool query; all=%#v", query, searcher.queries)
 		}
+	}
+}
+
+func TestChineseTechnicalSearchAllowsEnglishEntityQueries(t *testing.T) {
+	searcher := &recordingSearchProvider{}
+	researchModel := &scriptedResearchModel{calls: [][]model.ToolCall{
+		{toolCall("search-1", "web_search", map[string]any{"queries": []string{
+			"WinML API reference Microsoft",
+			"WinML ONNX model inference Windows",
+			"WinML DirectML GPU acceleration",
+		}})},
+		{toolCall("done-1", "done", map[string]any{})},
+	}}
+	researcher := Researcher{ResearchModel: researchModel, SearchProvider: searcher}
+	_, err := researcher.Research(context.Background(), ResearchRequest{
+		Query: "\u4e3a\u6211\u4ecb\u7ecd\u4e00\u4e0b\u4ec0\u4e48\u662f\u5fae\u8f6f\u7684WinML",
+		Classification: Classification{
+			ShouldSearch:       true,
+			StandaloneFollowUp: "\u4e3a\u6211\u4ecb\u7ecd\u4e00\u4e0b\u4ec0\u4e48\u662f\u5fae\u8f6f\u7684WinML",
+			Sources:            []SearchSource{SearchSourceWeb},
+		},
+		Mode:    ModeQuality,
+		Sources: []SearchSource{SearchSourceWeb},
+	})
+	if err != nil {
+		t.Fatalf("Research: %v", err)
+	}
+	want := []string{
+		"WinML API reference Microsoft",
+		"WinML ONNX model inference Windows",
+		"WinML DirectML GPU acceleration",
+	}
+	got := map[string]bool{}
+	for _, query := range searcher.queries {
+		got[query] = true
+	}
+	for _, query := range want {
+		if !got[query] {
+			t.Fatalf("queries=%#v, want English technical query %q", searcher.queries, query)
+		}
+	}
+	if len(searcher.queries) != len(want) {
+		t.Fatalf("queries=%#v, want English technical queries %#v", searcher.queries, want)
+	}
+}
+
+func TestFinalTechnicalResultsFilterLowValueSearchPages(t *testing.T) {
+	req := ResearchRequest{
+		Query: "\u4e3a\u6211\u4ecb\u7ecd\u4e00\u4e0b\u4ec0\u4e48\u662f\u5fae\u8f6f\u7684WinML",
+		SearchPlan: &SearchPlan{Queries: []PlannedSearchQuery{
+			{Query: "WinML API reference Microsoft", Source: SearchSourceWeb},
+			{Query: "WinML ONNX model inference Windows", Source: SearchSourceWeb},
+		}},
+	}
+	ranked := rankFinalResearchResults(req, []SearchResult{
+		{
+			Query:   "WinML API \u529f\u80fd \u7279\u6027",
+			Title:   "winml api \u529f\u80fd \u7279\u6027 - 360\u6587\u5e93",
+			URL:     "https://wenku.so.com/s?q=winml%20api",
+			Content: "short search landing page",
+		},
+		{
+			Query:   "\u5fae\u8f6f\u7684WinML",
+			Title:   "\u5fae\u8f6f_\u767e\u5ea6\u767e\u79d1",
+			URL:     "https://baike.baidu.com/item/%E5%BE%AE%E8%BD%AF/124767",
+			Content: "\u5fae\u8f6f\u516c\u53f8\u4ecb\u7ecd",
+		},
+		{
+			Title:   "Windows AI | Microsoft Learn",
+			URL:     "https://learn.microsoft.com/en-us/windows/ai/",
+			Content: "Windows Machine Learning and WinML guidance for local AI inference.",
+		},
+		{
+			Title:   "GitHub - microsoft/WindowsML",
+			URL:     "https://github.com/microsoft/WindowsML",
+			Content: "Official repo for Windows ML, Microsoft's high-performance local AI inferencing framework for Windows.",
+		},
+	})
+	if len(ranked) != 2 {
+		t.Fatalf("ranked=%#v, want only official technical sources", ranked)
+	}
+	for _, result := range ranked {
+		if strings.Contains(result.URL, "wenku.so.com") || strings.Contains(result.URL, "baike.baidu.com") {
+			t.Fatalf("low-value source survived: %#v", ranked)
+		}
+	}
+	if !strings.Contains(ranked[0].URL, "learn.microsoft.com") && !strings.Contains(ranked[0].URL, "github.com/microsoft") {
+		t.Fatalf("top result = %#v, want official technical source", ranked[0])
 	}
 }
 
