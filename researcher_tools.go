@@ -264,7 +264,7 @@ func rankFinalResearchResults(req ResearchRequest, results []SearchResult) []Sea
 	if len(queries) == 0 {
 		queries = []string{firstNonEmpty(req.Classification.StandaloneFollowUp, req.Query)}
 	}
-	if !containsAnyTerm(strings.ToLower(strings.Join(queries, "\n")), technicalEnglishSearchAnchors()) {
+	if !shouldApplySourceAwareRanking(queries) {
 		return results
 	}
 	return lexicalRankAndFilterResults(uniqueStrings(queries), results)
@@ -721,18 +721,11 @@ func queryLanguageCompatible(req ResearchRequest, query string) bool {
 }
 
 func allowsEnglishTechnicalSearch(req ResearchRequest, query string) bool {
-	if containsCJK(query) {
-		return false
-	}
-	queryText := strings.ToLower(query)
-	if !containsAnyTerm(queryText, technicalEnglishSearchAnchors()) {
-		return false
-	}
-	contextText := strings.ToLower(strings.Join(append(
+	contextText := strings.Join(append(
 		[]string{req.Query, req.Classification.StandaloneFollowUp},
 		searchPlanQueries(req.SearchPlan)...,
-	), "\n"))
-	return containsAnyTerm(contextText, technicalEnglishSearchAnchors())
+	), "\n")
+	return allowsEnglishSourceQuery(contextText, query)
 }
 
 func hasAllowedEnglishTechnicalSearchQueries(req ResearchRequest, queries []string) bool {
@@ -742,21 +735,6 @@ func hasAllowedEnglishTechnicalSearchQueries(req ResearchRequest, queries []stri
 		}
 	}
 	return false
-}
-
-func technicalEnglishSearchAnchors() []string {
-	return []string{
-		"winml",
-		"windows ml",
-		"windows-ml",
-		"windows machine learning",
-		"directml",
-		"onnx",
-		"onnx runtime",
-		"openvino",
-		"cuda",
-		"rocm",
-	}
 }
 
 func prefersChineseSearch(req ResearchRequest) bool {
@@ -942,7 +920,7 @@ func lexicalResultScore(queries []string, anchors []string, result SearchResult)
 		}
 	}
 	if preferredTechnicalSource(queries, result) {
-		score += 60
+		score += 140
 	}
 	return score
 }
@@ -955,21 +933,26 @@ func queriesForResult(queries []string, result SearchResult) []string {
 }
 
 func preferredTechnicalSource(queries []string, result SearchResult) bool {
-	queryText := strings.ToLower(strings.Join(queries, "\n"))
-	if !containsAnyTerm(queryText, technicalEnglishSearchAnchors()) {
+	if !shouldApplySourceAwareRanking(queries) {
 		return false
 	}
 	haystack := strings.ToLower(result.URL + "\n" + result.Title)
 	return containsAnyTerm(haystack, []string{
-		"learn.microsoft.com",
-		"github.com/microsoft",
-		"onnxruntime.ai",
+		"github.com",
+		"gitlab.com",
+		"docs.",
+		"/docs",
+		"/documentation",
+		"/reference",
+		"/api/",
+		"api.",
+		"learn.",
+		"readthedocs.io",
 	})
 }
 
 func lowValueTechnicalSource(queries []string, result SearchResult) bool {
-	queryText := strings.ToLower(strings.Join(queries, "\n"))
-	if !containsAnyTerm(queryText, technicalEnglishSearchAnchors()) || preferredTechnicalSource(queries, result) {
+	if !shouldApplySourceAwareRanking(queries) || preferredTechnicalSource(queries, result) {
 		return false
 	}
 	rawURL := strings.ToLower(result.URL)
@@ -982,10 +965,182 @@ func lowValueTechnicalSource(queries []string, result SearchResult) bool {
 	}) {
 		return true
 	}
-	if strings.Contains(title, "360") && strings.Contains(title, "winml") {
+	if strings.Contains(title, "360") && containsAnyTerm(title, queryAnchorTerms(queries)) {
 		return true
 	}
 	return false
+}
+
+func shouldApplySourceAwareRanking(queries []string) bool {
+	queryText := strings.Join(queries, "\n")
+	return hasSourceQueryIntent(queryText) && len(queryAnchorTerms(queries)) > 0
+}
+
+func allowsEnglishSourceQuery(contextText string, query string) bool {
+	query = strings.TrimSpace(query)
+	if query == "" || containsCJK(query) {
+		return false
+	}
+	if !sharesLatinEntityTerm(contextText, query) {
+		return false
+	}
+	lower := strings.ToLower(query)
+	return hasSearchOperatorOrDomainConstraint(lower) || hasSourceQueryIntent(lower) || hasTechnicalInfoIntent(lower)
+}
+
+func sharesLatinEntityTerm(left string, right string) bool {
+	leftTerms := latinEntityTermSet(left)
+	if len(leftTerms) == 0 {
+		return false
+	}
+	for term := range latinEntityTermSet(right) {
+		if leftTerms[term] {
+			return true
+		}
+	}
+	return false
+}
+
+func latinEntityTermSet(text string) map[string]bool {
+	out := map[string]bool{}
+	for _, token := range asciiQueryTokens(text) {
+		for _, term := range latinEntityTerms(token) {
+			out[term] = true
+		}
+	}
+	return out
+}
+
+func latinEntityTerms(token string) []string {
+	token = strings.Trim(token, ".#+")
+	if len(token) < 2 {
+		return nil
+	}
+	lower := strings.ToLower(token)
+	if isSourceQueryIntentTerm(lower) || isCommonQueryToken(lower) {
+		return nil
+	}
+	var out []string
+	if isLikelyEntityAnchor(token) || len(lower) >= 3 {
+		out = append(out, lower)
+	}
+	acronym := uppercaseSequence(token)
+	if len(acronym) >= 2 {
+		out = append(out, strings.ToLower(acronym))
+		if len(acronym) > 2 {
+			out = append(out, strings.ToLower(acronym[len(acronym)-2:]))
+		}
+	}
+	return uniqueStrings(out)
+}
+
+func isCommonQueryToken(token string) bool {
+	switch token {
+	case "the", "and", "for", "with", "from", "into", "what", "how", "why", "main", "best", "new", "latest", "about", "using", "use", "guide", "search", "query":
+		return true
+	default:
+		return false
+	}
+}
+
+func uppercaseSequence(token string) string {
+	var b strings.Builder
+	for _, r := range token {
+		if r >= 'A' && r <= 'Z' {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+func hasSearchOperatorOrDomainConstraint(query string) bool {
+	if containsAnyFold(query, "site:", "inurl:", "intitle:", "filetype:", "ext:", "source:", "https://", "http://") {
+		return true
+	}
+	for _, token := range asciiQueryTokens(query) {
+		token = strings.Trim(strings.ToLower(token), ".,;:()[]{}<>\"'")
+		if looksLikeDomainToken(token) {
+			return true
+		}
+	}
+	return false
+}
+
+func looksLikeDomainToken(token string) bool {
+	parts := strings.Split(token, ".")
+	if len(parts) < 2 {
+		return false
+	}
+	tld := parts[len(parts)-1]
+	if len(tld) < 2 || len(tld) > 12 {
+		return false
+	}
+	for _, r := range tld {
+		if r < 'a' || r > 'z' {
+			return false
+		}
+	}
+	return true
+}
+
+func hasSourceQueryIntent(value string) bool {
+	lower := strings.ToLower(value)
+	if hasSearchOperatorOrDomainConstraint(lower) {
+		return true
+	}
+	for _, token := range asciiQueryTokens(lower) {
+		token = strings.Trim(token, ".#+")
+		if isSourceQueryIntentTerm(token) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasTechnicalInfoIntent(value string) bool {
+	for _, token := range asciiQueryTokens(strings.ToLower(value)) {
+		token = strings.Trim(token, ".#+")
+		switch token {
+		case "architecture", "runtime", "inference", "acceleration", "accelerator", "integration", "extension", "plugin", "driver", "kernel", "schema", "protocol", "benchmark":
+			return true
+		}
+	}
+	return false
+}
+
+func isSourceQueryIntentTerm(term string) bool {
+	for _, item := range sourceQueryIntentTerms() {
+		if term == item {
+			return true
+		}
+	}
+	return false
+}
+
+func sourceQueryIntentTerms() []string {
+	return []string{
+		"documentation",
+		"docs",
+		"document",
+		"api",
+		"reference",
+		"sdk",
+		"developer",
+		"developers",
+		"spec",
+		"specification",
+		"standard",
+		"github",
+		"gitlab",
+		"repository",
+		"repo",
+		"manual",
+		"example",
+		"examples",
+		"sample",
+		"samples",
+		"guide",
+	}
 }
 
 func queryAnchorTerms(queries []string) []string {
@@ -1023,8 +1178,6 @@ func isLikelyEntityAnchor(token string) bool {
 	}
 	lower := strings.ToLower(token)
 	switch lower {
-	case "winml", "directml", "onnx", "openvino", "cuda", "rocm":
-		return true
 	case "the", "and", "for", "with", "from", "into", "what", "how", "why", "main", "best", "new", "latest", "official", "docs", "example", "examples":
 		return false
 	}
@@ -1051,12 +1204,7 @@ func isLikelyEntityAnchor(token string) bool {
 }
 
 func queryAnchorAliases(term string) []string {
-	switch term {
-	case "winml":
-		return []string{"windows ml", "windows machine learning"}
-	default:
-		return nil
-	}
+	return nil
 }
 
 func (r Researcher) deepReadQuality(ctx context.Context, req ResearchRequest, queries []string, results []SearchResult) []SearchResult {

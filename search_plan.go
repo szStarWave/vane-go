@@ -210,15 +210,12 @@ func normalizeSearchPlan(plan SearchPlan, rawQuery string, classification Classi
 }
 
 func allowsEnglishTechnicalPlanQuery(rawQuery string, plan SearchPlan, query string) bool {
-	if containsCJK(query) {
-		return false
-	}
-	queryText := strings.ToLower(query)
-	if !containsAnyTerm(queryText, technicalEnglishSearchAnchors()) {
-		return false
-	}
-	contextText := strings.ToLower(rawQuery + "\n" + plan.Topic + "\n" + plan.AnswerGoal)
-	return containsAnyTerm(contextText, technicalEnglishSearchAnchors())
+	contextText := strings.Join(append([]string{
+		rawQuery,
+		plan.Topic,
+		plan.AnswerGoal,
+	}, searchPlanQueries(&plan)...), "\n")
+	return allowsEnglishSourceQuery(contextText, query)
 }
 
 func prioritizeTechnicalPlanQueries(rawQuery string, plan SearchPlan, queries []PlannedSearchQuery, limit int, allowedSources []SearchSource, seen map[string]bool) []PlannedSearchQuery {
@@ -265,51 +262,27 @@ func prioritizeTechnicalPlanQueries(rawQuery string, plan SearchPlan, queries []
 }
 
 func technicalPlanQueryOverrides(rawQuery string, plan SearchPlan) []PlannedSearchQuery {
-	context := strings.ToLower(strings.Join(append([]string{
+	context := strings.Join(append([]string{
 		rawQuery,
 		plan.Topic,
 		plan.AnswerGoal,
-	}, searchPlanQueries(&plan)...), "\n"))
+	}, searchPlanQueries(&plan)...), "\n")
+	if !needsOfficialSourcePlan(context) {
+		return nil
+	}
 	var queries []string
-	add := func(items ...string) {
-		for _, item := range items {
-			item = strings.TrimSpace(item)
-			if item != "" {
-				queries = append(queries, item)
-			}
+	for _, entity := range sourcePlanEntities(context) {
+		queries = append(queries,
+			entity+" official documentation",
+			entity+" API reference",
+			entity+" GitHub repository",
+		)
+		if len(queries) >= 9 {
+			break
 		}
 	}
-	if containsAnyTerm(context, []string{"winml", "windows ml", "windows machine learning"}) {
-		add(
-			"WinML API reference Microsoft",
-			"WinML Windows Machine Learning official documentation",
-			"WinML ONNX model inference Windows",
-			"WinML DirectML GPU acceleration",
-		)
-	} else {
-		if containsAnyTerm(context, []string{"onnx", "onnx runtime"}) {
-			add(
-				"ONNX Runtime official documentation",
-				"ONNX Runtime API reference",
-				"ONNX model inference Windows",
-			)
-		}
-		if containsAnyTerm(context, []string{"directml"}) {
-			add(
-				"DirectML Microsoft Learn",
-				"DirectML API reference Microsoft",
-				"DirectML GPU acceleration ONNX Runtime",
-			)
-		}
-		if containsAnyTerm(context, []string{"openvino"}) {
-			add("OpenVINO official documentation", "OpenVINO API reference", "OpenVINO model inference")
-		}
-		if containsAnyTerm(context, []string{"cuda"}) {
-			add("CUDA official documentation", "CUDA API reference", "CUDA GPU acceleration")
-		}
-		if containsAnyTerm(context, []string{"rocm"}) {
-			add("ROCm official documentation", "ROCm API reference", "ROCm GPU acceleration")
-		}
+	if len(queries) == 0 {
+		return nil
 	}
 	queries = uniqueStrings(queries)
 	out := make([]PlannedSearchQuery, 0, len(queries))
@@ -320,6 +293,37 @@ func technicalPlanQueryOverrides(rawQuery string, plan SearchPlan) []PlannedSear
 			Source:   SearchSourceWeb,
 			Priority: i + 1,
 		})
+	}
+	return out
+}
+
+func needsOfficialSourcePlan(context string) bool {
+	if hasSourceQueryIntent(context) {
+		return true
+	}
+	return containsAnyFold(context,
+		"what is", "what are", "how does",
+		"\u4ec0\u4e48\u662f", "\u4ecb\u7ecd", "\u5b9a\u4e49", "\u539f\u7406", "\u6280\u672f", "\u6846\u67b6",
+	)
+}
+
+func sourcePlanEntities(context string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, token := range asciiQueryTokens(context) {
+		token = strings.Trim(token, ".")
+		if token == "" || !isLikelyEntityAnchor(token) || isSourceQueryIntentTerm(strings.ToLower(token)) {
+			continue
+		}
+		key := strings.ToLower(token)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, token)
+		if len(out) >= 3 {
+			break
+		}
 	}
 	return out
 }

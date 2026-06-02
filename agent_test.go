@@ -777,8 +777,8 @@ func TestSearchPlannerFallbackForChineseIntroQuestion(t *testing.T) {
 		if !strings.Contains(lowerQuery, "winml") {
 			t.Fatalf("query = %q, want WinML topic; plan=%#v", item.Query, plan)
 		}
-		if !containsCJK(item.Query) && !containsAnyFold(item.Query, "microsoft", "windows machine learning", "onnx", "directml") {
-			t.Fatalf("query = %q, want official technical WinML query; plan=%#v", item.Query, plan)
+		if !containsCJK(item.Query) && !containsAnyFold(item.Query, "official documentation", "api reference", "github repository") {
+			t.Fatalf("query = %q, want source-oriented WinML query; plan=%#v", item.Query, plan)
 		}
 	}
 	return
@@ -806,9 +806,9 @@ func TestSearchPlannerPrioritizesEnglishTechnicalQueriesForChineseWinMLPlan(t *t
 	}, rawQuery, Classification{ShouldSearch: true}, ModeQuality, []SearchSource{SearchSourceWeb}, time.Date(2026, 6, 2, 10, 0, 0, 0, time.FixedZone("CST", 8*60*60)))
 
 	want := []string{
-		"WinML API reference Microsoft",
-		"WinML Windows Machine Learning official documentation",
-		"WinML ONNX model inference Windows",
+		"WinML official documentation",
+		"WinML API reference",
+		"WinML GitHub repository",
 	}
 	if len(plan.Queries) < len(want) {
 		t.Fatalf("queries=%#v, want technical query overrides", plan.Queries)
