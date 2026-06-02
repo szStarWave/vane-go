@@ -176,12 +176,7 @@ func normalizeSearchPlan(plan SearchPlan, rawQuery string, classification Classi
 			plan.Language = "en"
 		}
 	}
-	entityContext := strings.Join(append([]string{
-		rawQuery,
-		plan.Topic,
-		plan.AnswerGoal,
-	}, searchPlanQueries(&plan)...), "\n")
-	plan.Entities = normalizeSearchEntities(append(plan.Entities, sourcePlanEntities(entityContext)...))
+	plan.Entities = primarySearchEntities(rawQuery, plan)
 	limit := plannedQueryLimit(mode)
 	var out []PlannedSearchQuery
 	seen := map[string]bool{}
@@ -309,6 +304,20 @@ func technicalPlanQueryOverrides(rawQuery string, plan SearchPlan) []PlannedSear
 		})
 	}
 	return out
+}
+
+func primarySearchEntities(rawQuery string, plan SearchPlan) []string {
+	directContext := strings.Join([]string{rawQuery, plan.Topic}, "\n")
+	direct := sourcePlanEntities(directContext)
+	if len(direct) > 0 {
+		return normalizeSearchEntities(direct)
+	}
+	entityContext := strings.Join(append([]string{
+		rawQuery,
+		plan.Topic,
+		plan.AnswerGoal,
+	}, searchPlanQueries(&plan)...), "\n")
+	return normalizeSearchEntities(append(plan.Entities, sourcePlanEntities(entityContext)...))
 }
 
 func normalizeSearchEntities(entities []string) []string {
