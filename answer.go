@@ -94,7 +94,7 @@ func Answer(ctx context.Context, req Request) (<-chan *model.Response, error) {
 		ResultCount: len(result.Sources),
 	})
 	writerReq := &model.Request{
-		Messages:         buildWriterMessages(req.Messages, result.Sources, result.Widgets, req.SystemInstructions, mode, now),
+		Messages:         buildWriterMessages(req.Messages, result.Sources, result.Widgets, req.SystemInstructions, mode, now, result.SearchPlan),
 		GenerationConfig: genConfig,
 		ExtraFields:      req.ExtraFields,
 	}
@@ -264,8 +264,8 @@ func totalResultLimit(mode Mode) int {
 	}
 }
 
-func buildWriterMessages(messages []model.Message, results []SearchResult, widgets []WidgetResult, instructions string, mode Mode, now time.Time) []model.Message {
-	writerPrompt := getWriterPrompt(formatSearchContext(results), formatWidgetContext(widgets), instructions, mode, now)
+func buildWriterMessages(messages []model.Message, results []SearchResult, widgets []WidgetResult, instructions string, mode Mode, now time.Time, plan *SearchPlan) []model.Message {
+	writerPrompt := getWriterPrompt(formatSearchContext(results), formatWidgetContext(widgets), instructions, mode, now, plan)
 	out := make([]model.Message, 0, len(messages)+1)
 	out = append(out, model.Message{Role: model.RoleSystem, Content: writerPrompt})
 	for _, msg := range messages {
@@ -309,7 +309,7 @@ func formatWidgetContext(widgets []WidgetResult) string {
 	return b.String()
 }
 
-func getWriterPrompt(contextText, widgetText, systemInstructions string, mode Mode, now time.Time) string {
+func getWriterPrompt(contextText, widgetText, systemInstructions string, mode Mode, now time.Time, plan *SearchPlan) string {
 	depth := ""
 	if mode == ModeQuality {
 		depth = "\n- YOU ARE CURRENTLY SET IN QUALITY MODE: generate a very deep, detailed, comprehensive response using the full context provided. When the sources support it, frame the answer like a research report and aim for at least 2000 words."
@@ -317,10 +317,12 @@ func getWriterPrompt(contextText, widgetText, systemInstructions string, mode Mo
 	if mode == ModeSpeed {
 		depth = "\n- Speed mode: answer concisely and prioritize the most relevant source facts."
 	}
+	answerGoal := formatAnswerGoalContext(plan)
 	return fmt.Sprintf(`You are Vane, an AI model skilled in web search and crafting detailed, engaging, well-structured answers. You excel at summarizing web pages, extracting relevant information, and creating professional, blog-style responses.
 
 Your task:
 - Thoroughly answer the user's latest question using the provided research context.
+- If <answer_goal> is present, use it to decide the final answer shape and scope. Do not treat it as a search source.
 - Use Markdown with clear headings and subheadings when useful.
 - Maintain a neutral, journalistic tone with engaging narrative flow.
 - Start directly with the answer or introduction; do not add a main title unless the user asks for one.
@@ -343,7 +345,26 @@ Current date and time: %s
 <context>
 %s
 %s
-</context>`, depth, strings.TrimSpace(systemInstructions), now.Format(time.RFC3339), contextText, widgetText)
+%s
+</context>`, depth, strings.TrimSpace(systemInstructions), now.Format(time.RFC3339), answerGoal, contextText, widgetText)
+}
+
+func formatAnswerGoalContext(plan *SearchPlan) string {
+	if plan == nil || strings.TrimSpace(plan.AnswerGoal) == "" {
+		return ""
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, `<answer_goal>%s</answer_goal>`+"\n", xmlishEscape(plan.AnswerGoal))
+	if len(plan.ReportSections) > 0 {
+		b.WriteString(`<suggested_sections>`)
+		for _, section := range plan.ReportSections {
+			if strings.TrimSpace(section) != "" {
+				fmt.Fprintf(&b, `<section>%s</section>`, xmlishEscape(section))
+			}
+		}
+		b.WriteString("</suggested_sections>\n")
+	}
+	return b.String()
 }
 
 func latestUserText(messages []model.Message) string {

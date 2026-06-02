@@ -90,11 +90,25 @@ func TestAnswerUsesSearchResultsInWriterPrompt(t *testing.T) {
 }
 
 func TestQualityWriterPromptMatchesOriginalDepthRequirement(t *testing.T) {
-	prompt := getWriterPrompt("<search_results><result index=\"1\">Fact</result></search_results>", "", "", ModeQuality, time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC))
+	prompt := getWriterPrompt("<search_results><result index=\"1\">Fact</result></search_results>", "", "", ModeQuality, time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC), nil)
 	if !strings.Contains(prompt, "at least 2000 words") ||
 		!strings.Contains(prompt, "frame the answer like a research report") ||
 		!strings.Contains(prompt, "do not add a main title") {
 		t.Fatalf("quality writer prompt missing original depth/format requirements: %s", prompt)
+	}
+}
+
+func TestWriterPromptIncludesAnswerGoal(t *testing.T) {
+	prompt := getWriterPrompt("<search_results><result index=\"1\">Fact</result></search_results>", "", "", ModeBalanced, time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC), &SearchPlan{
+		AnswerGoal:     "生成市场影响分析报告",
+		ReportSections: []string{"背景", "影响"},
+	})
+	if !strings.Contains(prompt, "<answer_goal>生成市场影响分析报告</answer_goal>") ||
+		!strings.Contains(prompt, "<section>背景</section>") {
+		t.Fatalf("writer prompt missing answer goal context: %s", prompt)
+	}
+	if !strings.Contains(prompt, "Do not treat it as a search source") {
+		t.Fatalf("writer prompt missing answer goal source guard: %s", prompt)
 	}
 }
 

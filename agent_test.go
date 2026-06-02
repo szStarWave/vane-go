@@ -681,6 +681,115 @@ func TestChineseVerboseSearchQueryIsRepaired(t *testing.T) {
 	}
 }
 
+func TestSearchPlannerSplitsChineseAnalysisGoal(t *testing.T) {
+	searcher := &recordingSearchProvider{}
+	classifier := &staticTextModel{text: `{
+		"classification": {
+			"skipSearch": false,
+			"personalSearch": false,
+			"academicSearch": false,
+			"discussionSearch": false,
+			"showWeatherWidget": false,
+			"showStockWidget": false,
+			"showCalculationWidget": false
+		},
+		"standaloneFollowUp": "帮我分析一下英伟达推出的新aipc硬件市场反响如何"
+	}`}
+	researchModel := &scriptedResearchModel{
+		queryPlanRaw: `{
+			"answer_goal": "分析英伟达新 AI PC 硬件的市场反响",
+			"topic": "英伟达新 AI PC 硬件市场反响",
+			"language": "zh",
+			"report_sections": ["背景", "市场反馈", "影响"],
+			"queries": [
+				{"query": "英伟达 AI PC 硬件 市场反响", "purpose": "核心市场反馈", "source": "web", "priority": 1},
+				{"query": "英伟达 AI PC 销量 评价", "purpose": "销量和用户评价", "source": "web", "priority": 2},
+				{"query": "英伟达 AI PC 厂商 生态 影响", "purpose": "产业影响", "source": "web", "priority": 3}
+			]
+		}`,
+		calls: [][]model.ToolCall{
+			{toolCall("search-1", "web_search", map[string]any{"queries": []string{"帮我分析一下英伟达推出的新aipc硬件市场反响如何"}})},
+			{toolCall("done-1", "done", map[string]any{})},
+		},
+	}
+	agent := SearchAgent{ClassifierModel: classifier, ResearchModel: researchModel, SearchProvider: searcher}
+	result, err := agent.Run(context.Background(), SearchAgentRequest{
+		Query:   "帮我分析一下英伟达推出的新aipc硬件市场反响如何",
+		Mode:    ModeQuality,
+		Sources: []SearchSource{SearchSourceWeb},
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if result.SearchPlan == nil || result.SearchPlan.AnswerGoal == "" || len(result.SearchPlan.Queries) < 3 {
+		t.Fatalf("SearchPlan = %#v, want answer goal and planned queries", result.SearchPlan)
+	}
+	if len(searcher.queries) == 0 {
+		t.Fatal("expected search queries")
+	}
+	for _, query := range searcher.queries {
+		if hasTaskLanguage(query) || looksLikeVerboseSearchQuery(query) {
+			t.Fatalf("query = %q, want planned keyword query; all=%#v", query, searcher.queries)
+		}
+		if !containsCJK(query) {
+			t.Fatalf("query = %q, want Chinese query; all=%#v", query, searcher.queries)
+		}
+	}
+}
+
+func TestSearchPlannerFallbackForChineseReportGoal(t *testing.T) {
+	plan := fallbackSearchPlanForQuery(
+		"给我生成哈尔滨昨日大风事故影响分析报告",
+		Classification{ShouldSearch: true, StandaloneFollowUp: "给我生成哈尔滨昨日大风事故影响分析报告"},
+		ModeQuality,
+		[]SearchSource{SearchSourceWeb},
+		time.Date(2026, 6, 1, 10, 0, 0, 0, time.FixedZone("CST", 8*60*60)),
+	)
+	if len(plan.Queries) < 3 {
+		t.Fatalf("queries = %#v, want several planned queries", plan.Queries)
+	}
+	for _, item := range plan.Queries {
+		if hasTaskLanguage(item.Query) || strings.Contains(item.Query, "分析报告") {
+			t.Fatalf("query = %q, leaked task language; plan=%#v", item.Query, plan)
+		}
+		if !containsCJK(item.Query) {
+			t.Fatalf("query = %q, want Chinese query", item.Query)
+		}
+	}
+}
+
+func TestDeterministicResearchUsesSearchPlanQueries(t *testing.T) {
+	searcher := &recordingSearchProvider{}
+	plan := &SearchPlan{Queries: []PlannedSearchQuery{
+		{Query: "英伟达 AI PC 硬件 市场反响", Source: SearchSourceWeb, Priority: 1},
+		{Query: "英伟达 AI PC 销量 评价", Source: SearchSourceWeb, Priority: 2},
+	}}
+	researcher := Researcher{SearchProvider: searcher}
+	_, err := researcher.Research(context.Background(), ResearchRequest{
+		Query: "帮我分析一下英伟达推出的新aipc硬件市场反响如何",
+		Classification: Classification{
+			ShouldSearch:       true,
+			StandaloneFollowUp: "帮我分析一下英伟达推出的新aipc硬件市场反响如何",
+			SearchPlan:         plan,
+			Sources:            []SearchSource{SearchSourceWeb},
+		},
+		SearchPlan: plan,
+		Mode:       ModeBalanced,
+		Sources:    []SearchSource{SearchSourceWeb},
+	})
+	if err != nil {
+		t.Fatalf("Research: %v", err)
+	}
+	if len(searcher.queries) != 2 {
+		t.Fatalf("queries=%#v, want planned queries", searcher.queries)
+	}
+	for _, query := range searcher.queries {
+		if hasTaskLanguage(query) {
+			t.Fatalf("query = %q, leaked task language", query)
+		}
+	}
+}
+
 func TestChineseSearchQueriesRejectEnglishRepair(t *testing.T) {
 	searcher := &recordingSearchProvider{}
 	researchModel := &scriptedResearchModel{
@@ -1276,6 +1385,7 @@ func (m *staticTextModel) GenerateContent(_ context.Context, req *model.Request)
 type scriptedResearchModel struct {
 	calls          [][]model.ToolCall
 	requests       []*model.Request
+	queryPlanRaw   string
 	queryRepair    []string
 	queryRepairRaw string
 }
@@ -1292,6 +1402,8 @@ func (m *scriptedResearchModel) GenerateContent(_ context.Context, req *model.Re
 	content := ""
 	var toolCalls []model.ToolCall
 	switch {
+	case strings.Contains(system, "search query planner"):
+		content = firstNonEmpty(m.queryPlanRaw, `{"answer_goal":"test goal","topic":"test topic","language":"en","queries":[{"query":"test topic","source":"web","priority":1}]}`)
 	case strings.Contains(system, "search query repairer"):
 		if m.queryRepairRaw != "" {
 			content = m.queryRepairRaw

@@ -54,7 +54,7 @@ func (r Researcher) researchWithTools(ctx context.Context, req ResearchRequest) 
 	if len(tools) == 0 {
 		return nil, false, nil
 	}
-	query := firstNonEmpty(strings.TrimSpace(req.Classification.StandaloneFollowUp), req.Query)
+	query := firstNonEmpty(strings.TrimSpace(req.Classification.AnswerGoal), strings.TrimSpace(req.Classification.StandaloneFollowUp), req.Query)
 	emitSearchEvent(ctx, r.OnSearchEvent, SearchEvent{
 		Type:       SearchEventStart,
 		Mode:       req.Mode,
@@ -68,7 +68,7 @@ func (r Researcher) researchWithTools(ctx context.Context, req ResearchRequest) 
 		StepTotal: iterations,
 	})
 	history := []model.Message{
-		model.NewUserMessage(fmt.Sprintf("<conversation>\n%s\nUser: %s (Standalone question: %s)\n</conversation>", formatMessagesForPrompt(tailMessages(req.Messages, 10)), req.Query, query)),
+		model.NewUserMessage(fmt.Sprintf("<conversation>\n%s\nUser: %s (Standalone question: %s)\n</conversation>\n%s", formatMessagesForPrompt(tailMessages(req.Messages, 10)), req.Query, query, formatSearchPlanForResearch(req.SearchPlan))),
 	}
 	var out []SearchResult
 	seen := map[string]int{}
@@ -476,10 +476,17 @@ func actionResultFromSearch(results []SearchResult, err error) researchActionRes
 
 func (r Researcher) executeQueries(ctx context.Context, req ResearchRequest, source SearchSource, queries []string) ([]SearchResult, error) {
 	if len(queries) == 0 {
-		queries = []string{firstNonEmpty(req.Classification.StandaloneFollowUp, req.Query)}
+		queries = plannedQueriesForSource(req.SearchPlan, source)
+		if len(queries) == 0 {
+			queries = []string{firstNonEmpty(req.Classification.StandaloneFollowUp, req.Query)}
+		}
+	} else if shouldReplaceWithPlannedQueries(req.SearchPlan, source, queries) {
+		queries = plannedQueriesForSource(req.SearchPlan, source)
 	}
+	queries = cleanTaskQueries(queries, req.Now)
 	queries = uniqueStrings(queries)
 	queries = r.repairSearchQueries(ctx, req, source, queries)
+	queries = cleanTaskQueries(queries, req.Now)
 	queries = preserveSearchQueryLanguage(req, queries)
 	if len(queries) > 3 {
 		queries = queries[:3]
@@ -581,7 +588,7 @@ If the input queries are already good keyword queries, return them unchanged.`),
 
 func needsQueryRepair(queries []string) bool {
 	for _, query := range queries {
-		if looksLikeVerboseSearchQuery(query) {
+		if looksLikeVerboseSearchQuery(query) || hasTaskLanguage(query) {
 			return true
 		}
 	}
@@ -594,7 +601,7 @@ func looksLikeVerboseSearchQuery(query string) bool {
 	if len(runes) > 38 {
 		return true
 	}
-	verbosePhrases := []string{"搜索", "看看", "分析", "一下", "哪些", "如何", "为什么", "please", "tell me", "what are", "how does"}
+	verbosePhrases := []string{"搜索", "看看", "分析", "一下", "哪些", "如何", "为什么", "帮我", "给我", "生成", "写一份", "分析报告", "please", "tell me", "what are", "how does", "generate", "write a", "analysis report"}
 	lower := strings.ToLower(query)
 	for _, phrase := range verbosePhrases {
 		if strings.Contains(lower, phrase) {
@@ -1204,6 +1211,7 @@ Today's date: %s
 <response_protocol>
 - NEVER output normal text. ONLY call tools.
 - Use targeted keyword queries, maximum 3 per search tool call.
+- If <query_plan> is present, follow its planned queries and purposes. Do not send the user's full task instruction to search tools.
 - Preserve the user's search language. If the user asks in Chinese, search with Chinese queries and Chinese/local source terms unless the user explicitly asks for English or global sources.
 - Default to web_search when information is missing or stale.
 - Call done when enough information has been gathered.
@@ -1279,6 +1287,7 @@ func webSearchActionDescription(mode Mode) string {
 
 Your queries should be very targeted and specific to the information you need, avoid broad or generic queries.
 Your queries shouldn't be sentences but rather keywords that are SEO friendly and can be used to search the web for information.
+Do not include command/task phrases like "help me", "generate a report", "write a report", "帮我", "生成", "写一份", or "分析报告" in search queries.
 Preserve the user's language for search queries. If the user query is Chinese, write Chinese keyword queries and keep Chinese dates, place names, event words, and official-source terms in Chinese unless the user explicitly asks for English/global sources.
 
 You can search for 3 queries in one go, make sure to utilize all 3 queries to maximize the information you can gather. If a question is simple, then split your queries to cover different aspects or related topics to get a comprehensive understanding.`

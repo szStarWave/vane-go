@@ -88,6 +88,7 @@ const (
 	SearchEventToolCall       SearchEventType = "tool_call"
 	SearchEventToolResult     SearchEventType = "tool_result"
 	SearchEventWidget         SearchEventType = "widget"
+	SearchEventQueryPlan      SearchEventType = "query_plan"
 	SearchEventSourceBlock    SearchEventType = "source_block"
 	SearchEventWriterStart    SearchEventType = "writer_start"
 	SearchEventWriterDelta    SearchEventType = "writer_delta"
@@ -111,6 +112,7 @@ type SearchEvent struct {
 	ToolCall       *ToolCallEvent   `json:"tool_call,omitempty"`
 	ToolResult     *ToolResultEvent `json:"tool_result,omitempty"`
 	Widget         *WidgetResult    `json:"widget,omitempty"`
+	SearchPlan     *SearchPlan      `json:"search_plan,omitempty"`
 	SourceBlock    *SourceBlock     `json:"source_block,omitempty"`
 	Message        string           `json:"message,omitempty"`
 	Metadata       map[string]any   `json:"metadata,omitempty"`
@@ -154,6 +156,8 @@ type Classification struct {
 	ShouldSearch       bool           `json:"should_search"`
 	SkipSearch         bool           `json:"skipSearch,omitempty"`
 	StandaloneFollowUp string         `json:"standaloneFollowUp,omitempty"`
+	AnswerGoal         string         `json:"answer_goal,omitempty"`
+	SearchPlan         *SearchPlan    `json:"search_plan,omitempty"`
 	Intent             string         `json:"intent,omitempty"`
 	Reason             string         `json:"reason,omitempty"`
 	Sources            []SearchSource `json:"sources,omitempty"`
@@ -165,6 +169,21 @@ type Classification struct {
 	NeedCalc           bool           `json:"need_calc,omitempty"`
 	NeedUploads        bool           `json:"need_uploads,omitempty"`
 	SkipReason         string         `json:"skip_reason,omitempty"`
+}
+
+type SearchPlan struct {
+	AnswerGoal     string               `json:"answer_goal,omitempty"`
+	Topic          string               `json:"topic,omitempty"`
+	Language       string               `json:"language,omitempty"`
+	Queries        []PlannedSearchQuery `json:"queries,omitempty"`
+	ReportSections []string             `json:"report_sections,omitempty"`
+}
+
+type PlannedSearchQuery struct {
+	Query    string       `json:"query"`
+	Purpose  string       `json:"purpose,omitempty"`
+	Source   SearchSource `json:"source,omitempty"`
+	Priority int          `json:"priority,omitempty"`
 }
 
 type ToolCallEvent struct {

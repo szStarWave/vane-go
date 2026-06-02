@@ -41,6 +41,7 @@ type SearchAgentRequest struct {
 
 type SearchAgentResult struct {
 	Classification Classification
+	SearchPlan     *SearchPlan
 	Sources        []SearchResult
 	Widgets        []WidgetResult
 }
@@ -51,12 +52,25 @@ func (a SearchAgent) Run(ctx context.Context, req SearchAgentRequest) (SearchAge
 		mode = ModeBalanced
 	}
 	classification := a.classify(ctx, req)
+	if classification.ShouldSearch {
+		classification = a.planSearch(ctx, req, classification)
+	}
 	emitSearchEvent(ctx, a.OnSearchEvent, SearchEvent{
 		Type:           SearchEventClassification,
 		Mode:           mode,
 		Query:          req.Query,
 		Classification: &classification,
 	})
+	if classification.SearchPlan != nil {
+		emitSearchEvent(ctx, a.OnSearchEvent, SearchEvent{
+			Type:       SearchEventQueryPlan,
+			Mode:       mode,
+			Query:      req.Query,
+			Queries:    searchPlanQueries(classification.SearchPlan),
+			QueryTotal: len(classification.SearchPlan.Queries),
+			SearchPlan: classification.SearchPlan,
+		})
+	}
 	widgets := a.runWidgets(ctx, req.Query, classification)
 	if !classification.ShouldSearch {
 		if len(widgets) > 0 {
@@ -87,6 +101,7 @@ func (a SearchAgent) Run(ctx context.Context, req SearchAgentRequest) (SearchAge
 		Messages:                req.Messages,
 		ExtraFields:             req.ExtraFields,
 		Classification:          classification,
+		SearchPlan:              classification.SearchPlan,
 		Mode:                    mode,
 		Sources:                 classification.Sources,
 		FileIDs:                 req.FileIDs,
@@ -108,6 +123,7 @@ func (a SearchAgent) Run(ctx context.Context, req SearchAgentRequest) (SearchAge
 	})
 	return SearchAgentResult{
 		Classification: classification,
+		SearchPlan:     classification.SearchPlan,
 		Sources:        limitResultsForContext(mode, sources),
 		Widgets:        widgets,
 	}, err
@@ -370,6 +386,7 @@ func classifySearch(req SearchAgentRequest) Classification {
 		ShouldSearch:       true,
 		SkipSearch:         false,
 		StandaloneFollowUp: query,
+		AnswerGoal:         query,
 		Intent:             "web_research",
 		Reason:             "The user enabled Vane search, so Vane will gather sources before answering.",
 		Sources:            sources,
@@ -495,6 +512,7 @@ type ResearchRequest struct {
 	Messages                []model.Message
 	ExtraFields             map[string]any
 	Classification          Classification
+	SearchPlan              *SearchPlan
 	Mode                    Mode
 	Sources                 []SearchSource
 	FileIDs                 []string
@@ -518,7 +536,7 @@ func (r Researcher) researchDeterministic(ctx context.Context, req ResearchReque
 	if iterations <= 0 {
 		iterations = defaultMaxIterations(req.Mode)
 	}
-	queries := buildResearchQueries(req.Query, req.Mode, iterations, req.Now)
+	queries := plannedResearchQueries(req, iterations)
 	emitSearchEvent(ctx, r.OnSearchEvent, SearchEvent{
 		Type:       SearchEventStart,
 		Mode:       req.Mode,

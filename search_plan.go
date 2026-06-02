@@ -1,0 +1,442 @@
+package vane
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"strings"
+	"time"
+
+	"trpc.group/trpc-go/trpc-agent-go/model"
+)
+
+func (a SearchAgent) planSearch(ctx context.Context, req SearchAgentRequest, classification Classification) Classification {
+	fallback := fallbackSearchPlanForQuery(req.Query, classification, req.Mode, req.Sources, req.Now)
+	plannerModel := firstModel(a.ResearchModel, a.ClassifierModel)
+	if plannerModel == nil || strings.TrimSpace(req.Query) == "" {
+		return applySearchPlanToClassification(classification, fallback)
+	}
+	planCtx, cancel := context.WithTimeout(ctx, plannerTimeout(req.Mode))
+	defer cancel()
+	ch, err := plannerModel.GenerateContent(planCtx, &model.Request{
+		Messages: []model.Message{
+			model.NewSystemMessage(searchPlannerSystemPrompt()),
+			model.NewUserMessage(searchPlannerUserPrompt(req, classification)),
+		},
+		GenerationConfig: model.GenerationConfig{Stream: false, Temperature: floatPtr(0), MaxTokens: intPtr(520)},
+		ExtraFields:      req.ExtraFields,
+	})
+	if err != nil {
+		return applySearchPlanToClassification(classification, fallback)
+	}
+	text, err := collectResponseText(planCtx, ch)
+	if err != nil || strings.TrimSpace(text) == "" {
+		return applySearchPlanToClassification(classification, fallback)
+	}
+	plan, err := parseSearchPlanJSON(text, req, classification)
+	if err != nil {
+		return applySearchPlanToClassification(classification, fallback)
+	}
+	plan = normalizeSearchPlan(plan, req.Query, classification, req.Mode, req.Sources, req.Now)
+	if len(plan.Queries) == 0 {
+		plan = fallback
+	}
+	return applySearchPlanToClassification(classification, plan)
+}
+
+func plannerTimeout(mode Mode) time.Duration {
+	switch mode {
+	case ModeSpeed:
+		return 3 * time.Second
+	case ModeQuality:
+		return 10 * time.Second
+	default:
+		return 6 * time.Second
+	}
+}
+
+func searchPlannerSystemPrompt() string {
+	return `You are Vane's search query planner. Return compact JSON only.
+
+Schema:
+{
+  "answer_goal": "what the final answer should accomplish",
+  "topic": "clean research topic without command phrases",
+  "language": "zh|en|other",
+  "report_sections": ["optional final-answer sections"],
+  "queries": [
+    {"query":"short search-engine keyword query","purpose":"why this query is useful","source":"web|academic|discussions|uploads","priority":1}
+  ]
+}
+
+Rules:
+- Separate the user's final answer goal from search queries.
+- Search queries must be short keywords or focused sub-questions, not the user's full instruction.
+- Remove task phrases such as "help me", "analyze", "generate a report", "write a report", "帮我", "分析一下", "生成", "写一份", "分析报告" from queries.
+- Preserve entities, dates, locations, constraints, and the user's language.
+- If the user asks in Chinese, every query MUST be Chinese unless the user explicitly asks for English/global sources.
+- For analysis/report requests, cover several evidence angles: background, latest developments, data/scale, official or primary sources, impact/risk, and differing views.
+- Return only useful queries. Do not invent sources that are not enabled.`
+}
+
+func searchPlannerUserPrompt(req SearchAgentRequest, classification Classification) string {
+	now := time.Now()
+	if !req.Now.IsZero() {
+		now = req.Now
+	}
+	return fmt.Sprintf("Current date: %s\nMode: %s\nEnabled sources: %s\nClassification intent: %s\nStandalone follow-up: %s\nConversation history:\n%s\n\nLatest user query:\n%s",
+		now.Format("2006-01-02"),
+		req.Mode,
+		joinSources(normalizeSources(req.Sources, req.FileIDs)),
+		classification.Intent,
+		firstNonEmpty(classification.StandaloneFollowUp, req.Query),
+		formatMessagesForPrompt(req.Messages),
+		strings.TrimSpace(req.Query),
+	)
+}
+
+type searchPlanJSON struct {
+	AnswerGoal        string   `json:"answer_goal"`
+	AnswerGoalAlt     string   `json:"answerGoal"`
+	Topic             string   `json:"topic"`
+	Language          string   `json:"language"`
+	ReportSections    []string `json:"report_sections"`
+	ReportSectionsAlt []string `json:"reportSections"`
+	Queries           []struct {
+		Query    string `json:"query"`
+		Purpose  string `json:"purpose"`
+		Source   string `json:"source"`
+		Priority int    `json:"priority"`
+	} `json:"queries"`
+}
+
+func parseSearchPlanJSON(text string, req SearchAgentRequest, classification Classification) (SearchPlan, error) {
+	raw := extractJSONObject(text)
+	var parsed searchPlanJSON
+	if err := json.Unmarshal([]byte(raw), &parsed); err != nil {
+		return SearchPlan{}, err
+	}
+	plan := SearchPlan{
+		AnswerGoal: firstNonEmpty(parsed.AnswerGoal, parsed.AnswerGoalAlt),
+		Topic:      parsed.Topic,
+		Language:   parsed.Language,
+	}
+	plan.ReportSections = append(plan.ReportSections, parsed.ReportSections...)
+	plan.ReportSections = append(plan.ReportSections, parsed.ReportSectionsAlt...)
+	for _, item := range parsed.Queries {
+		source := SearchSource(strings.TrimSpace(item.Source))
+		if source == "" {
+			source = SearchSourceWeb
+		}
+		plan.Queries = append(plan.Queries, PlannedSearchQuery{
+			Query:    item.Query,
+			Purpose:  item.Purpose,
+			Source:   source,
+			Priority: item.Priority,
+		})
+	}
+	if plan.AnswerGoal == "" && plan.Topic == "" && len(plan.Queries) == 0 {
+		return SearchPlan{}, fmt.Errorf("vane: empty search plan")
+	}
+	return normalizeSearchPlan(plan, req.Query, classification, req.Mode, req.Sources, req.Now), nil
+}
+
+func applySearchPlanToClassification(classification Classification, plan SearchPlan) Classification {
+	plan.AnswerGoal = strings.TrimSpace(firstNonEmpty(plan.AnswerGoal, classification.StandaloneFollowUp))
+	classification.AnswerGoal = plan.AnswerGoal
+	classification.SearchPlan = &plan
+	if strings.TrimSpace(classification.StandaloneFollowUp) == "" {
+		classification.StandaloneFollowUp = firstNonEmpty(plan.Topic, plan.AnswerGoal)
+	}
+	return classification
+}
+
+func normalizeSearchPlan(plan SearchPlan, rawQuery string, classification Classification, mode Mode, sources []SearchSource, now time.Time) SearchPlan {
+	allowedSources := normalizeSources(append(append([]SearchSource{}, sources...), classification.Sources...), nil)
+	if len(allowedSources) == 0 {
+		allowedSources = classification.Sources
+	}
+	if len(allowedSources) == 0 {
+		allowedSources = []SearchSource{SearchSourceWeb}
+	}
+	plan.AnswerGoal = strings.TrimSpace(firstNonEmpty(plan.AnswerGoal, classification.StandaloneFollowUp, rawQuery))
+	plan.Topic = cleanSearchTaskQuery(firstNonEmpty(plan.Topic, classification.StandaloneFollowUp, rawQuery), now)
+	if plan.Language == "" {
+		if containsCJK(rawQuery) {
+			plan.Language = "zh"
+		} else {
+			plan.Language = "en"
+		}
+	}
+	limit := plannedQueryLimit(mode)
+	var out []PlannedSearchQuery
+	seen := map[string]bool{}
+	for _, item := range plan.Queries {
+		query := cleanSearchTaskQuery(item.Query, now)
+		if query == "" {
+			continue
+		}
+		if containsCJK(rawQuery) && !queryLanguageExplicitlyAllowsEnglish(rawQuery) && !containsCJK(query) {
+			continue
+		}
+		source := item.Source
+		if source == "" || !hasSource(allowedSources, source) {
+			source = SearchSourceWeb
+		}
+		key := string(source) + "\x00" + strings.ToLower(query)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		item.Query = query
+		item.Source = source
+		if item.Priority <= 0 {
+			item.Priority = len(out) + 1
+		}
+		out = append(out, item)
+		if len(out) >= limit {
+			break
+		}
+	}
+	plan.Queries = out
+	if len(plan.ReportSections) == 0 && looksLikeReportGoal(plan.AnswerGoal+" "+rawQuery) {
+		plan.ReportSections = defaultReportSections(rawQuery)
+	}
+	return plan
+}
+
+func fallbackSearchPlanForQuery(query string, classification Classification, mode Mode, sources []SearchSource, now time.Time) SearchPlan {
+	topic := cleanSearchTaskQuery(firstNonEmpty(classification.StandaloneFollowUp, query), now)
+	if topic == "" {
+		topic = cleanSearchTaskQuery(query, now)
+	}
+	answerGoal := strings.TrimSpace(firstNonEmpty(classification.AnswerGoal, classification.StandaloneFollowUp, query))
+	plan := SearchPlan{
+		AnswerGoal: answerGoal,
+		Topic:      topic,
+		Language:   "en",
+	}
+	if containsCJK(query) {
+		plan.Language = "zh"
+	}
+	for i, q := range fallbackPlannedQueries(topic, query, mode) {
+		plan.Queries = append(plan.Queries, PlannedSearchQuery{
+			Query:    q,
+			Purpose:  fallbackQueryPurpose(q, i),
+			Source:   SearchSourceWeb,
+			Priority: i + 1,
+		})
+	}
+	plan.ReportSections = defaultReportSections(query)
+	return normalizeSearchPlan(plan, query, classification, mode, sources, now)
+}
+
+func fallbackPlannedQueries(topic string, rawQuery string, mode Mode) []string {
+	if topic == "" {
+		return nil
+	}
+	var queries []string
+	if containsCJK(rawQuery) {
+		queries = []string{topic}
+		if looksLikeIncidentQuery(rawQuery) {
+			queries = append(queries, topic+" 官方通报", topic+" 事故 伤亡", topic+" 交通 停电 损失", topic+" 影响")
+		} else if looksLikeIndustryReportQuery(rawQuery) {
+			queries = append(queries, topic+" 市场规模", topic+" 竞争格局", topic+" 政策", topic+" 趋势", topic+" 风险")
+		} else {
+			queries = append(queries, topic+" 最新进展", topic+" 数据 评价", topic+" 影响 风险", topic+" 官方 一手来源", topic+" 不同观点")
+		}
+	} else {
+		queries = []string{topic, topic + " latest developments", topic + " data analysis", topic + " impact risks", topic + " official sources", topic + " opposing views"}
+	}
+	queries = uniqueStrings(queries)
+	limit := plannedQueryLimit(mode)
+	if len(queries) > limit {
+		return queries[:limit]
+	}
+	return queries
+}
+
+func plannedQueryLimit(mode Mode) int {
+	switch mode {
+	case ModeSpeed:
+		return 3
+	case ModeQuality:
+		return 12
+	default:
+		return 6
+	}
+}
+
+func cleanSearchTaskQuery(query string, now time.Time) string {
+	query = strings.TrimSpace(resolveRelativeDateQuery(query, now))
+	if query == "" {
+		return ""
+	}
+	replacements := []string{
+		"请帮我", "", "帮我", "", "帮忙", "", "麻烦", "",
+		"给我生成", "", "生成一份", "", "生成一个", "", "生成", "",
+		"写一份", "", "写一个", "", "写篇", "",
+		"分析一下", "", "分析下", "",
+		"看一下", "", "看看", "", "搜索一下", "", "搜索", "", "查找", "",
+		"的分析报告", "", "分析报告", "", "研究报告", "", "行业报告", "",
+		"help me", "", "please", "", "generate", "", "write a", "", "write an", "",
+		"analysis report", "", "report about", "",
+	}
+	replacer := strings.NewReplacer(replacements...)
+	query = replacer.Replace(query)
+	query = strings.Trim(query, " \t\r\n,，。.!！?？:：;；-—")
+	for strings.Contains(query, "  ") {
+		query = strings.ReplaceAll(query, "  ", " ")
+	}
+	return strings.TrimSpace(query)
+}
+
+func hasTaskLanguage(query string) bool {
+	return containsAnyFold(query,
+		"帮我", "请帮", "给我", "生成", "写一份", "写一个", "分析一下", "分析报告", "研究报告", "行业报告",
+		"help me", "please", "generate", "write a", "analysis report",
+	)
+}
+
+func looksLikeReportGoal(query string) bool {
+	return containsAnyFold(query, "报告", "分析", "report", "analysis")
+}
+
+func looksLikeIncidentQuery(query string) bool {
+	return containsAnyFold(query, "事故", "伤亡", "灾害", "大风", "龙卷风", "暴雨", "强对流", "停电", "incident", "casualties", "storm")
+}
+
+func looksLikeIndustryReportQuery(query string) bool {
+	return containsAnyFold(query, "行业", "市场", "产业", "竞争", "industry", "market", "sector")
+}
+
+func defaultReportSections(query string) []string {
+	if !looksLikeReportGoal(query) {
+		return nil
+	}
+	if containsCJK(query) {
+		return []string{"背景", "关键事实", "数据与证据", "影响与风险", "结论"}
+	}
+	return []string{"Background", "Key facts", "Evidence", "Impact and risks", "Conclusion"}
+}
+
+func fallbackQueryPurpose(query string, index int) string {
+	switch index {
+	case 0:
+		return "core topic"
+	case 1:
+		return "latest developments"
+	case 2:
+		return "data and evidence"
+	case 3:
+		return "impact and risk"
+	default:
+		return "additional perspective"
+	}
+}
+
+func searchPlanQueries(plan *SearchPlan) []string {
+	if plan == nil {
+		return nil
+	}
+	out := make([]string, 0, len(plan.Queries))
+	for _, item := range plan.Queries {
+		if strings.TrimSpace(item.Query) != "" {
+			out = append(out, strings.TrimSpace(item.Query))
+		}
+	}
+	return out
+}
+
+func plannedResearchQueries(req ResearchRequest, iterations int) []string {
+	queries := searchPlanQueries(req.SearchPlan)
+	if len(queries) == 0 {
+		queries = searchPlanQueries(req.Classification.SearchPlan)
+	}
+	if len(queries) == 0 {
+		fallback := fallbackSearchPlanForQuery(req.Query, req.Classification, req.Mode, req.Sources, req.Now)
+		queries = searchPlanQueries(&fallback)
+	}
+	if len(queries) == 0 {
+		queries = buildResearchQueries(req.Query, req.Mode, iterations, req.Now)
+	}
+	queries = cleanTaskQueries(queries, req.Now)
+	queries = uniqueStrings(queries)
+	if iterations > 0 && len(queries) > iterations {
+		return queries[:iterations]
+	}
+	return queries
+}
+
+func plannedQueriesForSource(plan *SearchPlan, source SearchSource) []string {
+	if plan == nil {
+		return nil
+	}
+	var out []string
+	for _, item := range plan.Queries {
+		if strings.TrimSpace(item.Query) == "" {
+			continue
+		}
+		if item.Source == "" || item.Source == source || source == SearchSourceWeb {
+			out = append(out, item.Query)
+		}
+	}
+	return uniqueStrings(out)
+}
+
+func shouldReplaceWithPlannedQueries(plan *SearchPlan, source SearchSource, queries []string) bool {
+	if len(plannedQueriesForSource(plan, source)) == 0 {
+		return false
+	}
+	for _, query := range queries {
+		if hasTaskLanguage(query) || looksLikeVerboseSearchQuery(query) {
+			return true
+		}
+	}
+	return false
+}
+
+func cleanTaskQueries(queries []string, now time.Time) []string {
+	out := make([]string, 0, len(queries))
+	for _, query := range queries {
+		cleaned := cleanSearchTaskQuery(query, now)
+		if cleaned != "" {
+			out = append(out, cleaned)
+		}
+	}
+	return uniqueStrings(out)
+}
+
+func formatSearchPlanForResearch(plan *SearchPlan) string {
+	if plan == nil {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("<query_plan>\n")
+	if strings.TrimSpace(plan.AnswerGoal) != "" {
+		fmt.Fprintf(&b, "<answer_goal>%s</answer_goal>\n", xmlishEscape(plan.AnswerGoal))
+	}
+	if strings.TrimSpace(plan.Topic) != "" {
+		fmt.Fprintf(&b, "<topic>%s</topic>\n", xmlishEscape(plan.Topic))
+	}
+	if strings.TrimSpace(plan.Language) != "" {
+		fmt.Fprintf(&b, "<language>%s</language>\n", xmlishEscape(plan.Language))
+	}
+	for _, item := range plan.Queries {
+		if strings.TrimSpace(item.Query) == "" {
+			continue
+		}
+		fmt.Fprintf(&b, `<query source="%s" priority="%d" purpose="%s">%s</query>`+"\n", xmlishEscape(string(item.Source)), item.Priority, xmlishEscape(item.Purpose), xmlishEscape(item.Query))
+	}
+	if len(plan.ReportSections) > 0 {
+		b.WriteString("<report_sections>")
+		for _, section := range plan.ReportSections {
+			if strings.TrimSpace(section) != "" {
+				fmt.Fprintf(&b, "<section>%s</section>", xmlishEscape(section))
+			}
+		}
+		b.WriteString("</report_sections>\n")
+	}
+	b.WriteString("</query_plan>")
+	return b.String()
+}
