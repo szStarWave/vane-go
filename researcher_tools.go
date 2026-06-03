@@ -77,7 +77,10 @@ func (r Researcher) researchWithTools(ctx context.Context, req ResearchRequest) 
 	failedInfoCalls := 0
 	informationCalls := 0
 	stopReason := "max_iterations"
+	lastReasoningNoInfo := ""
+	repeatedReasoningNoProgress := 0
 	for step := 0; step < iterations; step++ {
+		sourcesBeforeStep := len(out)
 		prompt := getResearcherPrompt(req)
 		ch, err := r.ResearchModel.GenerateContent(ctx, &model.Request{
 			Messages: buildResearcherMessages(prompt, history, step, iterations, len(out), informationCalls),
@@ -146,6 +149,8 @@ func (r Researcher) researchWithTools(ctx context.Context, req ResearchRequest) 
 		}
 		wg.Wait()
 		done := false
+		stepInformationCalls := 0
+		var stepReasoning []string
 		for _, outcome := range outcomes {
 			call := outcome.call
 			name := outcome.name
@@ -155,6 +160,7 @@ func (r Researcher) researchWithTools(ctx context.Context, req ResearchRequest) 
 				firstErr = err
 			}
 			if actionResult.Type == "reasoning" && strings.TrimSpace(actionResult.Reasoning) != "" {
+				stepReasoning = append(stepReasoning, actionResult.Reasoning)
 				emitSearchEvent(ctx, r.OnSearchEvent, SearchEvent{
 					Type:      SearchEventResearchStep,
 					Mode:      req.Mode,
@@ -195,13 +201,15 @@ func (r Researcher) researchWithTools(ctx context.Context, req ResearchRequest) 
 				ResultCount: len(actionResult.Results),
 				Results:     actionResult.Results,
 			})
-			if isInformationTool(name) && len(actionResult.Results) == 0 && (err != nil || actionResult.Error != "") {
+			if isInformationTool(name) {
 				informationCalls++
-				failedInfoCalls++
-			} else if len(actionResult.Results) > 0 {
-				if isInformationTool(name) {
-					informationCalls++
+				stepInformationCalls++
+				if len(actionResult.Results) == 0 {
+					failedInfoCalls++
+				} else {
+					failedInfoCalls = 0
 				}
+			} else if len(actionResult.Results) > 0 {
 				failedInfoCalls = 0
 			}
 			if len(out) > before {
@@ -224,6 +232,22 @@ func (r Researcher) researchWithTools(ctx context.Context, req ResearchRequest) 
 		if done {
 			stopReason = "done"
 			break
+		}
+		if stepInformationCalls == 0 && len(stepReasoning) > 0 && len(out) == sourcesBeforeStep {
+			reasoningKey := normalizeReasoningProgressKey(strings.Join(stepReasoning, "\n"))
+			if reasoningKey != "" && reasoningKey == lastReasoningNoInfo {
+				repeatedReasoningNoProgress++
+			} else {
+				lastReasoningNoInfo = reasoningKey
+				repeatedReasoningNoProgress = 1
+			}
+			if repeatedReasoningNoProgress >= 2 {
+				stopReason = "repeated_reasoning_no_progress"
+				break
+			}
+		} else if stepInformationCalls > 0 || len(out) > sourcesBeforeStep {
+			lastReasoningNoInfo = ""
+			repeatedReasoningNoProgress = 0
 		}
 		if shouldStopAfterSoftInformationBudget(req.Mode, out, informationCalls, firstPositive(req.SoftMaxInformationCalls, r.SoftMaxInformationCalls)) {
 			stopReason = "soft_information_budget"
@@ -255,6 +279,10 @@ func rankFinalResearchResults(req ResearchRequest, results []SearchResult) []Sea
 	if len(results) == 0 {
 		return nil
 	}
+	results = filterResultsForStrategy(req, results)
+	if len(results) == 0 {
+		return nil
+	}
 	entities := searchPlanPrimaryEntities(req.SearchPlan)
 	results = enforcePrimaryEntityResults(entities, results)
 	if len(results) == 0 {
@@ -273,6 +301,18 @@ func rankFinalResearchResults(req ResearchRequest, results []SearchResult) []Sea
 		return results
 	}
 	return lexicalRankAndFilterResults(uniqueStrings(queries), entities, results)
+}
+
+func normalizeReasoningProgressKey(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if value == "" {
+		return ""
+	}
+	fields := strings.Fields(value)
+	if len(fields) == 0 {
+		return ""
+	}
+	return strings.Join(fields, " ")
 }
 
 func limitResultsForContext(mode Mode, results []SearchResult) []SearchResult {
@@ -361,6 +401,9 @@ func shouldStopAfterSoftInformationBudget(mode Mode, results []SearchResult, cal
 	if budget <= 0 || calls < budget {
 		return false
 	}
+	if mode == ModeQuality && len(results) > 0 && countUsefulResultsForStop(mode, results) == 0 && allLowValueResults(results) {
+		return true
+	}
 	switch mode {
 	case ModeQuality:
 		return countUsefulResultsForStop(mode, results) >= 12
@@ -369,6 +412,18 @@ func shouldStopAfterSoftInformationBudget(mode Mode, results []SearchResult, cal
 	default:
 		return countUsefulResultsForStop(mode, results) >= 3
 	}
+}
+
+func allLowValueResults(results []SearchResult) bool {
+	for _, result := range results {
+		if strings.TrimSpace(result.URL) == "" && strings.TrimSpace(result.Content) == "" {
+			continue
+		}
+		if !genericSearchResult(result) && len([]rune(strings.TrimSpace(result.Content))) >= 500 {
+			return false
+		}
+	}
+	return true
 }
 
 func countUsefulResultsForStop(mode Mode, results []SearchResult) int {
@@ -569,6 +624,7 @@ func (r Researcher) executeQueries(ctx context.Context, req ResearchRequest, sou
 	}
 	entities := searchPlanPrimaryEntities(req.SearchPlan)
 	all = r.rankAndDedupe(ctx, queries, entities, all, req.Mode)
+	all = filterResultsForStrategy(req, all)
 	if req.Mode == ModeQuality && source != SearchSourceUploads {
 		all = r.deepReadQuality(ctx, req, queries, all)
 	}
@@ -1490,6 +1546,63 @@ func qualityResultRelevant(queries []string, entities []string, result SearchRes
 	return true
 }
 
+func filterResultsForStrategy(req ResearchRequest, results []SearchResult) []SearchResult {
+	if effectiveSearchStrategy(req.SearchPlan) != SearchStrategyTemporalNews || len(results) == 0 {
+		return results
+	}
+	queries := searchPlanQueries(req.SearchPlan)
+	if len(queries) == 0 {
+		queries = []string{firstNonEmpty(req.Classification.StandaloneFollowUp, req.Query)}
+	}
+	filtered := make([]SearchResult, 0, len(results))
+	for _, result := range results {
+		if temporalNewsLowValueResult(queries, result) {
+			continue
+		}
+		filtered = append(filtered, result)
+	}
+	return filtered
+}
+
+func effectiveSearchStrategy(plan *SearchPlan) SearchStrategy {
+	if plan == nil {
+		return ""
+	}
+	return plan.Strategy
+}
+
+func temporalNewsLowValueResult(queries []string, result SearchResult) bool {
+	haystack := resultHaystack(result)
+	if strings.TrimSpace(haystack) == "" {
+		return true
+	}
+	if containsAnyTerm(haystack, []string{"wikipedia.org", "baike.baidu.com", "baike.", "\u767e\u79d1"}) {
+		return true
+	}
+	lowValueTerms := []string{
+		"calendar", "holiday", "holidays", "observance", "festival", "fixture", "fixtures",
+		"schedule", "timetable", "agenda", "match schedule", "sports schedule",
+		"\u5e74\u5386", "\u65e5\u5386", "\u8282\u5047\u65e5", "\u653e\u5047\u5b89\u6392",
+		"\u8d5b\u7a0b", "\u8d5b\u4e8b\u65e5\u7a0b", "\u65f6\u95f4\u8868",
+	}
+	if containsAnyTerm(haystack, lowValueTerms) && !containsAnyTerm(haystack, temporalNewsTerms()) {
+		return true
+	}
+	terms := queryRelevanceTerms(queries)
+	if len(terms) > 0 && countTermMatches(haystack, terms) == 0 && !containsAnyTerm(haystack, temporalNewsTerms()) {
+		return true
+	}
+	return false
+}
+
+func temporalNewsTerms() []string {
+	return []string{
+		"news", "breaking", "headline", "headlines", "reported", "reporting", "reuters", "associated press",
+		"latest update", "live updates", "world news", "international news",
+		"\u65b0\u95fb", "\u5feb\u8baf", "\u62a5\u9053", "\u6d88\u606f", "\u8d44\u8baf", "\u901a\u62a5", "\u53d1\u751f", "\u65f6\u4e8b",
+	}
+}
+
 func resultHaystack(result SearchResult) string {
 	return strings.ToLower(result.Title + "\n" + result.Content + "\n" + result.URL)
 }
@@ -1540,9 +1653,9 @@ func genericSearchResult(result SearchResult) bool {
 	genericTerms := []string{
 		"baike.", "wikipedia.org", "britannica.com", "mafengwo.cn", "chinahighlights.com",
 		"chinadiscovery.com", "holafly.com", "travel guide", "things to do", "places to visit",
-		"attractions", "facts", "spelling", "pronunciation",
+		"attractions", "facts", "spelling", "pronunciation", "calendar", "holiday", "schedule",
 		"\u767e\u79d1", "\u65c5\u6e38", "\u65c5\u6e38\u653b\u7565", "\u666f\u70b9",
-		"\u5fc5\u53bb", "\u82f1\u6587", "\u62fc\u5199", "\u600e\u4e48\u8bfb",
+		"\u5fc5\u53bb", "\u82f1\u6587", "\u62fc\u5199", "\u600e\u4e48\u8bfb", "\u5e74\u5386", "\u65e5\u5386", "\u8282\u5047\u65e5", "\u8d5b\u7a0b",
 	}
 	return containsAnyTerm(haystack, genericTerms)
 }

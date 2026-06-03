@@ -608,6 +608,7 @@ func (r Researcher) researchDeterministic(ctx context.Context, req ResearchReque
 			})
 		}
 	}
+	out = rankFinalResearchResults(req, out)
 	emitSearchEvent(ctx, r.OnSearchEvent, SearchEvent{
 		Type:        SearchEventEnd,
 		Mode:        req.Mode,

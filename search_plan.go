@@ -62,6 +62,7 @@ Schema:
 {
   "answer_goal": "what the final answer should accomplish",
   "topic": "clean research topic without command phrases",
+  "strategy": "focused|temporal_news|comparative|survey|exploratory",
   "language": "zh|en|other",
   "entities": ["key exact search entities, especially Latin names/acronyms/products/frameworks"],
   "report_sections": ["optional final-answer sections"],
@@ -76,7 +77,15 @@ Rules:
 - Remove task phrases such as "help me", "analyze", "generate a report", "write a report", "帮我", "分析一下", "生成", "写一份", "分析报告" from queries.
 - Preserve entities, dates, locations, constraints, and the user's language.
 - Put the main search entities in entities. For Chinese questions about Latin-named products, frameworks, APIs, libraries, models, or standards, keep those Latin entities exactly.
+- Choose strategy carefully:
+  - temporal_news for today, latest, breaking, current news, or date-bound news/event requests.
+  - focused for what-is, API/reference, GitHub, official docs, or narrow source lookup requests.
+  - comparative for compare/vs/evaluate-between requests.
+  - survey for broad market/industry/report/analysis requests.
+  - exploratory only when the user needs open-ended discovery.
 - If the user asks in Chinese, every query MUST be Chinese unless the user explicitly asks for English/global sources.
+- For temporal_news, search for news-relevant pages about the requested topic; avoid generic year pages, calendars, holidays, and schedules.
+- For focused technical/source requests, prefer official docs, API reference, repository, and primary sources.
 - For analysis/report requests, cover several evidence angles: background, latest developments, data/scale, official or primary sources, impact/risk, and differing views.
 - Return only useful queries. Do not invent sources that are not enabled.`
 }
@@ -101,6 +110,7 @@ type searchPlanJSON struct {
 	AnswerGoal        string   `json:"answer_goal"`
 	AnswerGoalAlt     string   `json:"answerGoal"`
 	Topic             string   `json:"topic"`
+	Strategy          string   `json:"strategy"`
 	Language          string   `json:"language"`
 	Entities          []string `json:"entities"`
 	EntitiesAlt       []string `json:"search_entities"`
@@ -124,6 +134,7 @@ func parseSearchPlanJSON(text string, req SearchAgentRequest, classification Cla
 	plan := SearchPlan{
 		AnswerGoal: firstNonEmpty(parsed.AnswerGoal, parsed.AnswerGoalAlt),
 		Topic:      parsed.Topic,
+		Strategy:   SearchStrategy(strings.TrimSpace(parsed.Strategy)),
 		Language:   parsed.Language,
 	}
 	plan.Entities = append(plan.Entities, parsed.Entities...)
@@ -169,6 +180,7 @@ func normalizeSearchPlan(plan SearchPlan, rawQuery string, classification Classi
 	}
 	plan.AnswerGoal = strings.TrimSpace(firstNonEmpty(plan.AnswerGoal, classification.StandaloneFollowUp, rawQuery))
 	plan.Topic = cleanSearchTaskQuery(firstNonEmpty(plan.Topic, classification.StandaloneFollowUp, rawQuery), now)
+	plan.Strategy = normalizeSearchStrategy(plan.Strategy, rawQuery, plan)
 	if plan.Language == "" {
 		if containsCJK(rawQuery) {
 			plan.Language = "zh"
@@ -216,6 +228,50 @@ func normalizeSearchPlan(plan SearchPlan, rawQuery string, classification Classi
 		plan.ReportSections = defaultReportSections(rawQuery)
 	}
 	return plan
+}
+
+func normalizeSearchStrategy(strategy SearchStrategy, rawQuery string, plan SearchPlan) SearchStrategy {
+	switch strategy {
+	case SearchStrategyFocused, SearchStrategyTemporalNews, SearchStrategyComparative, SearchStrategySurvey, SearchStrategyExploratory:
+		return strategy
+	default:
+		return inferSearchStrategy(rawQuery, plan)
+	}
+}
+
+func inferSearchStrategy(rawQuery string, plan SearchPlan) SearchStrategy {
+	context := strings.Join(append([]string{
+		rawQuery,
+		plan.Topic,
+		plan.AnswerGoal,
+	}, searchPlanQueries(&plan)...), "\n")
+	if looksLikeTemporalNewsQuery(context) {
+		return SearchStrategyTemporalNews
+	}
+	if looksLikeFocusedSourceQuery(context) {
+		return SearchStrategyFocused
+	}
+	if containsAnyFold(context, "compare", "comparison", " vs ", "versus", "\u5bf9\u6bd4", "\u6bd4\u8f83", "\u5dee\u5f02", "\u54ea\u4e2a\u66f4") {
+		return SearchStrategyComparative
+	}
+	if looksLikeReportGoal(context) || looksLikeIndustryReportQuery(context) || containsAnyFold(context, "survey", "landscape", "overview", "\u8c03\u7814", "\u7efc\u8ff0") {
+		return SearchStrategySurvey
+	}
+	return SearchStrategyFocused
+}
+
+func looksLikeTemporalNewsQuery(query string) bool {
+	return containsAnyFold(query,
+		"today", "latest", "breaking", "current news", "latest news", "news today", "recent news",
+		"\u4eca\u5929", "\u4eca\u65e5", "\u6700\u65b0", "\u65b0\u95fb", "\u8d44\u8baf", "\u5feb\u8baf", "\u7a81\u53d1", "\u65f6\u4e8b",
+	)
+}
+
+func looksLikeFocusedSourceQuery(query string) bool {
+	return hasSourceQueryIntent(query) || containsAnyFold(query,
+		"what is", "what are", "api", "reference", "github", "official", "documentation", "docs",
+		"\u4ec0\u4e48\u662f", "\u4ecb\u7ecd", "\u5b98\u65b9", "\u6587\u6863", "\u4ed3\u5e93",
+	)
 }
 
 func allowsEnglishTechnicalPlanQuery(rawQuery string, plan SearchPlan, query string) bool {
@@ -389,6 +445,7 @@ func fallbackSearchPlanForQuery(query string, classification Classification, mod
 	plan := SearchPlan{
 		AnswerGoal: answerGoal,
 		Topic:      topic,
+		Strategy:   inferSearchStrategy(query, SearchPlan{AnswerGoal: answerGoal, Topic: topic}),
 		Language:   "en",
 	}
 	if containsCJK(query) {
@@ -625,6 +682,9 @@ func formatSearchPlanForResearch(plan *SearchPlan) string {
 	}
 	if strings.TrimSpace(plan.Language) != "" {
 		fmt.Fprintf(&b, "<language>%s</language>\n", xmlishEscape(plan.Language))
+	}
+	if strings.TrimSpace(string(plan.Strategy)) != "" {
+		fmt.Fprintf(&b, "<strategy>%s</strategy>\n", xmlishEscape(string(plan.Strategy)))
 	}
 	if len(plan.Entities) > 0 {
 		b.WriteString("<entities>")

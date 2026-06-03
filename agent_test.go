@@ -116,6 +116,39 @@ func TestTemporalReplacementOnlyReplacesMatchedPhrase(t *testing.T) {
 	}
 }
 
+func TestSearchPlanInfersTemporalNewsStrategy(t *testing.T) {
+	plan := fallbackSearchPlanForQuery(
+		"\u4eca\u5929\u56fd\u9645\u65b0\u95fb",
+		Classification{ShouldSearch: true, StandaloneFollowUp: "\u4eca\u5929\u56fd\u9645\u65b0\u95fb", Sources: []SearchSource{SearchSourceWeb}},
+		ModeBalanced,
+		[]SearchSource{SearchSourceWeb},
+		time.Date(2026, 6, 1, 10, 0, 0, 0, time.UTC),
+	)
+	if plan.Strategy != SearchStrategyTemporalNews {
+		t.Fatalf("Strategy = %q, want temporal_news; plan=%#v", plan.Strategy, plan)
+	}
+	if formatted := formatSearchPlanForResearch(&plan); !strings.Contains(formatted, "<strategy>temporal_news</strategy>") {
+		t.Fatalf("formatted plan missing strategy: %s", formatted)
+	}
+}
+
+func TestSearchPlanInfersFocusedStrategyForTechnicalSources(t *testing.T) {
+	plan := fallbackSearchPlanForQuery(
+		"WinML \u662f\u4ec0\u4e48 API reference GitHub",
+		Classification{ShouldSearch: true, StandaloneFollowUp: "WinML \u662f\u4ec0\u4e48 API reference GitHub", Sources: []SearchSource{SearchSourceWeb}},
+		ModeQuality,
+		[]SearchSource{SearchSourceWeb},
+		time.Date(2026, 6, 1, 10, 0, 0, 0, time.UTC),
+	)
+	if plan.Strategy != SearchStrategyFocused {
+		t.Fatalf("Strategy = %q, want focused; plan=%#v", plan.Strategy, plan)
+	}
+	joined := strings.Join(searchPlanQueries(&plan), "\n")
+	if !strings.Contains(joined, "WinML API reference") || !strings.Contains(joined, "WinML GitHub repository") {
+		t.Fatalf("queries = %#v, want focused official/API/GitHub queries", searchPlanQueries(&plan))
+	}
+}
+
 func TestSearchAgentHarbinQuestionUsesAbsoluteDateQueries(t *testing.T) {
 	now := time.Date(2026, 6, 1, 10, 0, 0, 0, time.UTC)
 	searcher := &recordingSearchProvider{}
@@ -1478,8 +1511,8 @@ func TestSoftInformationBudgetRequiresUsefulQualityResults(t *testing.T) {
 		{Title: "哈尔滨旅游攻略", URL: "https://example.com/travel", Content: strings.Repeat("旅游", 20)},
 		{Title: "哈尔滨市人民政府", URL: "https://www.harbin.gov.cn/", Content: strings.Repeat("首页", 20)},
 	}
-	if shouldStopAfterSoftInformationBudget(ModeQuality, generic, 1, 1) {
-		t.Fatal("quality soft budget should not stop on generic or short results")
+	if !shouldStopAfterSoftInformationBudget(ModeQuality, generic, 1, 1) {
+		t.Fatal("quality soft budget should stop when the remaining results are generic or short")
 	}
 	var useful []SearchResult
 	for i := 0; i < 12; i++ {
@@ -1494,16 +1527,20 @@ func TestSoftInformationBudgetRequiresUsefulQualityResults(t *testing.T) {
 	}
 }
 
-func TestResearcherDoesNotSoftStopOnGenericQualityResults(t *testing.T) {
+func TestResearcherSoftStopsOnGenericQualityResults(t *testing.T) {
 	searcher := &genericSearchProvider{}
 	researchModel := &scriptedResearchModel{calls: [][]model.ToolCall{
 		{toolCall("search-1", "web_search", map[string]any{"queries": []string{"Harbin storm"}})},
 		{toolCall("search-2", "web_search", map[string]any{"queries": []string{"Harbin storm damage"}})},
 		{toolCall("done-1", "done", map[string]any{})},
 	}}
+	var events []SearchEvent
 	researcher := Researcher{
 		ResearchModel:  researchModel,
 		SearchProvider: searcher,
+		OnSearchEvent: func(_ context.Context, ev SearchEvent) {
+			events = append(events, ev)
+		},
 	}
 	_, err := researcher.Research(context.Background(), ResearchRequest{
 		Query: "storm impact",
@@ -1519,8 +1556,77 @@ func TestResearcherDoesNotSoftStopOnGenericQualityResults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Research: %v", err)
 	}
-	if len(researchModel.requests) < 2 {
-		t.Fatalf("research model requests = %d, want no soft stop on generic/short quality results", len(researchModel.requests))
+	if len(researchModel.requests) != 1 {
+		t.Fatalf("research model requests = %d, want soft stop after first generic result batch", len(researchModel.requests))
+	}
+	end := lastSearchEventOfType(events, SearchEventEnd)
+	if end == nil {
+		t.Fatalf("missing end event: %#v", events)
+	}
+	if got, _ := end.Metadata["stop_reason"].(string); got != "soft_information_budget" {
+		t.Fatalf("stop_reason = %q, want soft_information_budget; metadata=%#v", got, end.Metadata)
+	}
+}
+
+func TestResearcherStopsAfterRepeatedReasoningNoProgress(t *testing.T) {
+	researchModel := &scriptedResearchModel{calls: [][]model.ToolCall{
+		{toolCall("plan-1", "__reasoning_preamble", map[string]any{"plan": "Looking for the same angle."})},
+		{toolCall("plan-2", "__reasoning_preamble", map[string]any{"plan": "Looking for the same angle."})},
+		{toolCall("search-1", "web_search", map[string]any{"queries": []string{"should not run"}})},
+	}}
+	var events []SearchEvent
+	researcher := Researcher{
+		ResearchModel:  researchModel,
+		SearchProvider: &recordingSearchProvider{},
+		OnSearchEvent: func(_ context.Context, ev SearchEvent) {
+			events = append(events, ev)
+		},
+	}
+	_, err := researcher.Research(context.Background(), ResearchRequest{
+		Query: "current news",
+		Classification: Classification{
+			ShouldSearch:       true,
+			StandaloneFollowUp: "current news",
+			Sources:            []SearchSource{SearchSourceWeb},
+		},
+		Mode:    ModeQuality,
+		Sources: []SearchSource{SearchSourceWeb},
+	})
+	if err != nil {
+		t.Fatalf("Research: %v", err)
+	}
+	if len(researchModel.requests) != 2 {
+		t.Fatalf("research model requests = %d, want stop before third no-progress turn", len(researchModel.requests))
+	}
+	end := lastSearchEventOfType(events, SearchEventEnd)
+	if end == nil {
+		t.Fatalf("missing end event: %#v", events)
+	}
+	if got, _ := end.Metadata["stop_reason"].(string); got != "repeated_reasoning_no_progress" {
+		t.Fatalf("stop_reason = %q, want repeated_reasoning_no_progress; metadata=%#v", got, end.Metadata)
+	}
+}
+
+func TestTemporalNewsStrategyFiltersGenericTimePages(t *testing.T) {
+	req := ResearchRequest{
+		Query: "\u4eca\u5929\u56fd\u9645\u65b0\u95fb",
+		SearchPlan: &SearchPlan{
+			Strategy: SearchStrategyTemporalNews,
+			Queries:  []PlannedSearchQuery{{Query: "\u4eca\u5929\u56fd\u9645\u65b0\u95fb", Source: SearchSourceWeb}},
+		},
+		Classification: Classification{StandaloneFollowUp: "\u4eca\u5929\u56fd\u9645\u65b0\u95fb"},
+	}
+	ranked := rankFinalResearchResults(req, []SearchResult{
+		{Title: "2026 calendar", URL: "https://example.com/calendar-2026", Content: "Calendar, holidays and observances for 2026."},
+		{Title: "International Day schedule", URL: "https://example.com/international-day", Content: "Holiday observance schedule and timetable."},
+		{Title: "International news today - Reuters", URL: "https://www.reuters.com/world/", Content: "Latest international news and live updates from world events."},
+		{Title: "\u56fd\u9645\u65b0\u95fb_\u767e\u5ea6\u767e\u79d1", URL: "https://baike.baidu.com/item/news", Content: "\u767e\u79d1\u6761\u76ee"},
+	})
+	if len(ranked) != 1 {
+		t.Fatalf("ranked=%#v, want only the news source", ranked)
+	}
+	if !strings.Contains(ranked[0].URL, "reuters.com") {
+		t.Fatalf("top source = %#v, want Reuters news", ranked[0])
 	}
 }
 

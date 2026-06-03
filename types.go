@@ -153,6 +153,16 @@ const (
 	SearchSourceUploads     SearchSource = "uploads"
 )
 
+type SearchStrategy string
+
+const (
+	SearchStrategyFocused      SearchStrategy = "focused"
+	SearchStrategyTemporalNews SearchStrategy = "temporal_news"
+	SearchStrategyComparative  SearchStrategy = "comparative"
+	SearchStrategySurvey       SearchStrategy = "survey"
+	SearchStrategyExploratory  SearchStrategy = "exploratory"
+)
+
 type Classification struct {
 	ShouldSearch       bool           `json:"should_search"`
 	SkipSearch         bool           `json:"skipSearch,omitempty"`
@@ -175,6 +185,7 @@ type Classification struct {
 type SearchPlan struct {
 	AnswerGoal     string               `json:"answer_goal,omitempty"`
 	Topic          string               `json:"topic,omitempty"`
+	Strategy       SearchStrategy       `json:"strategy,omitempty"`
 	Language       string               `json:"language,omitempty"`
 	Entities       []string             `json:"entities,omitempty"`
 	Queries        []PlannedSearchQuery `json:"queries,omitempty"`
